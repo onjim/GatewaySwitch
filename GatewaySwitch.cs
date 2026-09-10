@@ -1684,7 +1684,11 @@ namespace YuanxinGateway
                     if (dns.AddressFamily == AddressFamily.InterNetwork ||
                         dns.AddressFamily == AddressFamily.InterNetworkV6)
                     {
-                        config.DnsServers.Add(dns.ToString());
+                        string dnsText = NormalizeAddressText(dns.ToString());
+                        if (!string.IsNullOrEmpty(dnsText) && !config.DnsServers.Contains(dnsText))
+                        {
+                            config.DnsServers.Add(dnsText);
+                        }
                     }
                 }
 
@@ -1863,20 +1867,26 @@ namespace YuanxinGateway
         public static void Restore(string targetGateway)
         {
             OriginalConfig original = LoadOriginal();
-            if (original.BackupVersion != 2 || string.IsNullOrEmpty(original.RoutesJson))
-                throw new InvalidOperationException("备份不存在或来自旧版，缺少可靠的网络标识。已保留备份，请先手动确认原始网络配置。");
+            if (original.InterfaceIndex <= 0 && string.IsNullOrEmpty(original.InterfaceId))
+            {
+                throw new InvalidOperationException("没有可恢复的备份配置。");
+            }
             WifiConfig current = GetCurrentNetworkConfig();
             int index = ResolveCurrentInterfaceIndex(original, current);
-            if (index <= 0 || current == null || !string.Equals(current.InterfaceId, original.InterfaceId, StringComparison.OrdinalIgnoreCase))
+            if (index <= 0 || current == null)
             {
                 throw new InvalidOperationException("原网卡未连接，已保留备份；请连接原网卡后重试。");
             }
             if (original.IsWifi && string.IsNullOrEmpty(current.Ssid))
+            {
                 throw new InvalidOperationException("无法确认当前 Wi-Fi，暂不恢复，备份已保留。");
+            }
             bool sameNetwork = IsSameNetwork(original, current);
             bool restoreIpv6 = !string.IsNullOrEmpty(original.TargetGatewayIpv6);
             if (!sameNetwork && (!original.IsDnsDhcp || (restoreIpv6 && !original.IsIpv6DnsDhcp)))
+            {
                 throw new InvalidOperationException("网络已变化，不能将旧网络的静态 DNS 写入新网络。请回到原网络恢复，备份已保留。");
+            }
             EnsureNetworkUnchanged(current);
             RunPowerShell(BuildRestoreCommand(original, index, sameNetwork));
             EnsureNetworkUnchanged(current);
@@ -1887,21 +1897,21 @@ namespace YuanxinGateway
 
         private static string BuildRestoreCommand(OriginalConfig original, int index, bool sameNetwork)
         {
-            string targetGateway = original.TargetGateway;
-            string targetGatewayIpv6 = original.TargetGatewayIpv6;
+            string targetGateway = !string.IsNullOrEmpty(original.TargetGateway) ? original.TargetGateway : GetConfigGatewayIp();
+            string targetGatewayIpv6 = !string.IsNullOrEmpty(original.TargetGatewayIpv6) ? original.TargetGatewayIpv6 : GetNormalizedConfigGatewayIpv6();
             bool restoreIpv6 = !string.IsNullOrEmpty(targetGatewayIpv6);
 
             string command = "$ErrorActionPreference='Stop';$idx=" + index + ";"
                 + "$target='" + EscapePowerShell(targetGateway) + "';"
                 + PowerShellNormalizeFunction()
                 + PowerShellDnsFunction()
-                + "foreach($store in @('ActiveStore','PersistentStore')){Get-NetRoute -PolicyStore $store -ErrorAction Stop | Where-Object { $_.InterfaceIndex -eq $idx -and $_.DestinationPrefix -eq '0.0.0.0/0' -and $_.NextHop -eq $target -and $_.Protocol -eq 'NetMgmt' } | Remove-NetRoute -Confirm:$false -ErrorAction Stop;}";
+                + "foreach($store in @('ActiveStore','PersistentStore')){Get-NetRoute -PolicyStore $store -ErrorAction SilentlyContinue | Where-Object { $_.InterfaceIndex -eq $idx -and $_.DestinationPrefix -eq '0.0.0.0/0' -and (Normalize-Address $_.NextHop) -eq (Normalize-Address $target) -and $_.Protocol -eq 'NetMgmt' } | Remove-NetRoute -Confirm:$false -ErrorAction SilentlyContinue;}";
 
             if (!string.IsNullOrEmpty(targetGatewayIpv6))
             {
                 command += "$target6='" + EscapePowerShell(targetGatewayIpv6) + "';"
                     + "$target6Norm=Normalize-Address $target6;"
-                    + "foreach($store in @('ActiveStore','PersistentStore')){Get-NetRoute -PolicyStore $store -ErrorAction Stop | Where-Object { $_.InterfaceIndex -eq $idx -and $_.DestinationPrefix -eq '::/0' -and (Normalize-Address $_.NextHop) -eq $target6Norm -and $_.Protocol -eq 'NetMgmt' } | Remove-NetRoute -Confirm:$false -ErrorAction Stop;}";
+                    + "foreach($store in @('ActiveStore','PersistentStore')){Get-NetRoute -PolicyStore $store -ErrorAction SilentlyContinue | Where-Object { $_.InterfaceIndex -eq $idx -and $_.DestinationPrefix -eq '::/0' -and (Normalize-Address $_.NextHop) -eq $target6Norm -and $_.Protocol -eq 'NetMgmt' } | Remove-NetRoute -Confirm:$false -ErrorAction SilentlyContinue;}";
             }
 
             if (sameNetwork)
@@ -1909,12 +1919,19 @@ namespace YuanxinGateway
                 command += RestoreRoutesCommand(original);
             }
 
-            command += "$dns=@(" + QuotePowerShellArray(original.DnsServers) + ");"
-                + "$dns4=@($dns | Where-Object { $_ -notlike '*:*' });"
-                + "$dns6=@($dns | Where-Object { $_ -like '*:*' });"
-                + (original.IsDnsDhcp ? "Reset-DnsFamily 'ipv4' $idx;" : "Set-NetshDnsFamily 'ipv4' $idx $dns4;");
+            List<string> cleanDns4 = original.DnsServers.FindAll(d => !d.Contains(":"));
+            List<string> cleanDns6 = original.DnsServers.FindAll(d => d.Contains(":"));
+
+            bool useDhcpV4 = original.IsDnsDhcp || cleanDns4.Count == 0;
+            bool useDhcpV6 = original.IsIpv6DnsDhcp || cleanDns6.Count == 0;
+
+            command += "$dns4=@(" + QuotePowerShellArray(cleanDns4) + ");"
+                + "$dns6=@(" + QuotePowerShellArray(cleanDns6) + ");"
+                + (useDhcpV4 ? "Reset-DnsFamily 'ipv4' $idx;" : "Set-NetshDnsFamily 'ipv4' $idx $dns4;");
             if (restoreIpv6)
-                command += original.IsIpv6DnsDhcp ? "Reset-DnsFamily 'ipv6' $idx;" : "Set-NetshDnsFamily 'ipv6' $idx $dns6;";
+            {
+                command += (useDhcpV6 ? "Reset-DnsFamily 'ipv6' $idx;" : "Set-NetshDnsFamily 'ipv6' $idx $dns6;");
+            }
 
             command += "Clear-DnsClientCache -ErrorAction SilentlyContinue;"
                 + "Register-DnsClient -ErrorAction SilentlyContinue;";
@@ -1990,12 +2007,26 @@ namespace YuanxinGateway
                 string gatewayIpv6 = Convert.ToString(key.GetValue("GatewayIpv6", string.Empty));
                 if (!string.IsNullOrEmpty(gatewayIpv6))
                 {
-                    config.Ipv6Gateways.AddRange(gatewayIpv6.Split(new[] { ';' }, StringSplitOptions.RemoveEmptyEntries));
+                    foreach (string item in gatewayIpv6.Split(new[] { ';' }, StringSplitOptions.RemoveEmptyEntries))
+                    {
+                        string norm = NormalizeAddressText(item);
+                        if (!string.IsNullOrEmpty(norm) && !config.Ipv6Gateways.Contains(norm))
+                        {
+                            config.Ipv6Gateways.Add(norm);
+                        }
+                    }
                 }
                 string dns = Convert.ToString(key.GetValue("DnsServers", string.Empty));
                 if (!string.IsNullOrEmpty(dns))
                 {
-                    config.DnsServers.AddRange(dns.Split(new[] { ';' }, StringSplitOptions.RemoveEmptyEntries));
+                    foreach (string item in dns.Split(new[] { ';' }, StringSplitOptions.RemoveEmptyEntries))
+                    {
+                        string norm = NormalizeAddressText(item);
+                        if (!string.IsNullOrEmpty(norm) && !config.DnsServers.Contains(norm))
+                        {
+                            config.DnsServers.Add(norm);
+                        }
+                    }
                 }
                 config.IsDnsDhcp = Convert.ToInt32(key.GetValue("IsDnsDhcp", 0)) == 1;
                 config.IsIpv6DnsDhcp = Convert.ToInt32(key.GetValue("IsIpv6DnsDhcp", 0)) == 1;
@@ -2006,6 +2037,39 @@ namespace YuanxinGateway
                 config.TargetGatewayIpv6 = Convert.ToString(key.GetValue("TargetGatewayIpv6", string.Empty));
                 config.RoutesJson = Convert.ToString(key.GetValue("RoutesJson", string.Empty));
                 config.BackupVersion = Convert.ToInt32(key.GetValue("BackupVersion", 0));
+
+                if (config.BackupVersion < 2)
+                {
+                    if (string.IsNullOrEmpty(config.TargetGateway))
+                    {
+                        config.TargetGateway = GetConfigGatewayIp();
+                    }
+                    if (string.IsNullOrEmpty(config.TargetGatewayIpv6))
+                    {
+                        config.TargetGatewayIpv6 = GetNormalizedConfigGatewayIpv6();
+                    }
+                    if (string.IsNullOrEmpty(config.Ssid))
+                    {
+                        config.Ssid = GetConfigSsid();
+                    }
+
+                    string normTarget4 = NormalizeAddressText(config.TargetGateway);
+                    string normTarget6 = NormalizeAddressText(config.TargetGatewayIpv6);
+
+                    bool hasNonTargetDns4 = config.DnsServers.Exists(d => !d.Contains(":") && d != normTarget4);
+                    bool hasNonTargetDns6 = config.DnsServers.Exists(d => d.Contains(":") && d != normTarget6);
+
+                    if (!hasNonTargetDns4)
+                    {
+                        config.IsDnsDhcp = true;
+                    }
+                    if (!hasNonTargetDns6)
+                    {
+                        config.IsIpv6DnsDhcp = true;
+                    }
+
+                    config.DnsServers.RemoveAll(d => d == normTarget4 || d == normTarget6);
+                }
             }
             return config;
         }
@@ -2038,15 +2102,61 @@ namespace YuanxinGateway
                 }
             }
 
-            return 0;
+            if (!string.IsNullOrEmpty(original.InterfaceAlias))
+            {
+                foreach (NetworkInterface item in NetworkInterface.GetAllNetworkInterfaces())
+                {
+                    try
+                    {
+                        IPInterfaceProperties props = item.GetIPProperties();
+                        IPv4InterfaceProperties ipv4Props = props.GetIPv4Properties();
+                        if (ipv4Props == null)
+                        {
+                            continue;
+                        }
+
+                        if (string.Equals(item.Name, original.InterfaceAlias, StringComparison.OrdinalIgnoreCase))
+                        {
+                            return ipv4Props.Index;
+                        }
+                    }
+                    catch
+                    {
+                    }
+                }
+            }
+
+            return current != null ? current.InterfaceIndex : 0;
         }
 
         private static bool IsSameNetwork(OriginalConfig original, WifiConfig current)
         {
-            return current != null && !string.IsNullOrEmpty(original.NetworkAddress) &&
-                string.Equals(original.InterfaceId, current.InterfaceId, StringComparison.OrdinalIgnoreCase) &&
-                original.NetworkAddress == current.NetworkAddress && original.IsWifi == current.IsWifi &&
-                (!original.IsWifi || (!string.IsNullOrEmpty(original.Ssid) && original.Ssid == current.Ssid));
+            if (current == null) return false;
+
+            bool idMatch = !string.IsNullOrEmpty(original.InterfaceId) &&
+                string.Equals(original.InterfaceId, current.InterfaceId, StringComparison.OrdinalIgnoreCase);
+            if (!idMatch && !string.IsNullOrEmpty(original.InterfaceAlias))
+            {
+                idMatch = string.Equals(original.InterfaceAlias, current.InterfaceAlias, StringComparison.OrdinalIgnoreCase);
+            }
+            if (!idMatch) return false;
+
+            if (original.BackupVersion >= 2)
+            {
+                return !string.IsNullOrEmpty(original.NetworkAddress) &&
+                    original.NetworkAddress == current.NetworkAddress && original.IsWifi == current.IsWifi &&
+                    (!original.IsWifi || (!string.IsNullOrEmpty(original.Ssid) && original.Ssid == current.Ssid));
+            }
+
+            if (current.IsWifi)
+            {
+                string expectedSsid = !string.IsNullOrEmpty(original.Ssid) ? original.Ssid : GetConfigSsid();
+                if (!string.IsNullOrEmpty(expectedSsid) && !string.IsNullOrEmpty(current.Ssid))
+                {
+                    return string.Equals(expectedSsid, current.Ssid, StringComparison.OrdinalIgnoreCase);
+                }
+            }
+            return true;
         }
 
         private static void EnsureNetworkUnchanged(WifiConfig expected)
@@ -2054,17 +2164,41 @@ namespace YuanxinGateway
             WifiConfig current = GetCurrentNetworkConfig();
             if (current == null || !string.Equals(expected.InterfaceId, current.InterfaceId, StringComparison.OrdinalIgnoreCase) ||
                 expected.NetworkAddress != current.NetworkAddress || expected.IsWifi != current.IsWifi ||
-                (expected.IsWifi && (string.IsNullOrEmpty(current.Ssid) || expected.Ssid != current.Ssid)))
+                (expected.IsWifi && !string.IsNullOrEmpty(expected.Ssid) && (string.IsNullOrEmpty(current.Ssid) || !string.Equals(expected.Ssid, current.Ssid, StringComparison.OrdinalIgnoreCase))))
                 throw new InvalidOperationException("操作期间网络已变化，已停止处理并保留备份。");
         }
 
         private static string RestoreRoutesCommand(OriginalConfig original)
         {
-            return "$savedRoutes=ConvertFrom-Json '" + EscapePowerShell(original.RoutesJson) + "';"
-                + "foreach($saved in $savedRoutes){$next=Add-ScopeIfNeeded $saved.NextHop $idx;"
-                + "$existing=@(Get-NetRoute -PolicyStore $saved.PolicyStore -ErrorAction Stop | Where-Object { $_.InterfaceIndex -eq $idx -and $_.DestinationPrefix -eq $saved.DestinationPrefix -and (Normalize-Address $_.NextHop) -eq (Normalize-Address $saved.NextHop) });"
-                + "if($existing.Count -eq 0){$options=@{InterfaceIndex=$idx;DestinationPrefix=$saved.DestinationPrefix;NextHop=$next;RouteMetric=$saved.RouteMetric;ErrorAction='Stop'};if($saved.PolicyStore -eq 'ActiveStore'){$options.PolicyStore='ActiveStore'};New-NetRoute @options | Out-Null;}"
-                + "else{$existing | Where-Object { $_.RouteMetric -ne $saved.RouteMetric } | Set-NetRoute -RouteMetric $saved.RouteMetric -Confirm:$false -ErrorAction Stop | Out-Null;}}";
+            if (!string.IsNullOrEmpty(original.RoutesJson))
+            {
+                return "$savedRoutes=ConvertFrom-Json '" + EscapePowerShell(original.RoutesJson) + "';"
+                    + "foreach($saved in $savedRoutes){$next=Add-ScopeIfNeeded $saved.NextHop $idx;"
+                    + "$existing=@(Get-NetRoute -PolicyStore $saved.PolicyStore -ErrorAction SilentlyContinue | Where-Object { $_.InterfaceIndex -eq $idx -and $_.DestinationPrefix -eq $saved.DestinationPrefix -and (Normalize-Address $_.NextHop) -eq (Normalize-Address $saved.NextHop) });"
+                    + "if($existing.Count -eq 0){$options=@{InterfaceIndex=$idx;DestinationPrefix=$saved.DestinationPrefix;NextHop=$next;RouteMetric=$saved.RouteMetric;ErrorAction='Stop'};if($saved.PolicyStore -eq 'ActiveStore'){$options.PolicyStore='ActiveStore'};New-NetRoute @options | Out-Null;}"
+                    + "else{$existing | Where-Object { $_.RouteMetric -ne $saved.RouteMetric } | Set-NetRoute -RouteMetric $saved.RouteMetric -Confirm:$false -ErrorAction Stop | Out-Null;}}";
+            }
+
+            string legacyCmd = string.Empty;
+            if (!string.IsNullOrEmpty(original.Gateway))
+            {
+                legacyCmd += "$oldgw='" + EscapePowerShell(original.Gateway) + "';"
+                    + "$existingV4=@(Get-NetRoute -InterfaceIndex $idx -DestinationPrefix '0.0.0.0/0' -ErrorAction SilentlyContinue | Where-Object { $_.NextHop -eq $oldgw });"
+                    + "if($existingV4.Count -eq 0){New-NetRoute -InterfaceIndex $idx -DestinationPrefix '0.0.0.0/0' -NextHop $oldgw -RouteMetric 10 -PolicyStore ActiveStore -ErrorAction SilentlyContinue | Out-Null;}";
+            }
+            if (original.Ipv6Gateways.Count > 0)
+            {
+                legacyCmd += "$oldgw6=@(" + QuotePowerShellArray(original.Ipv6Gateways) + ");"
+                    + "foreach($old in $oldgw6){if([string]::IsNullOrWhiteSpace($old)){continue;}"
+                    + "$oldNorm=Normalize-Address $old;"
+                    + "$existingV6=@(Get-NetRoute -InterfaceIndex $idx -DestinationPrefix '::/0' -ErrorAction SilentlyContinue | Where-Object { (Normalize-Address $_.NextHop) -eq $oldNorm });"
+                    + "if($existingV6.Count -eq 0){"
+                    + "$oldScoped=Add-ScopeIfNeeded $old $idx;"
+                    + "try{New-NetRoute -InterfaceIndex $idx -DestinationPrefix '::/0' -NextHop $old -RouteMetric 10 -PolicyStore ActiveStore -ErrorAction SilentlyContinue | Out-Null;}"
+                    + "catch{New-NetRoute -InterfaceIndex $idx -DestinationPrefix '::/0' -NextHop $oldScoped -RouteMetric 10 -PolicyStore ActiveStore -ErrorAction SilentlyContinue | Out-Null;}"
+                    + "}}";
+            }
+            return legacyCmd;
         }
 
         private static void VerifyRestored(OriginalConfig original, int index, bool sameNetwork)
@@ -2076,26 +2210,42 @@ namespace YuanxinGateway
 
         private static string BuildVerifyRoutesCommand(OriginalConfig original, int index, bool sameNetwork)
         {
+            string target4 = !string.IsNullOrEmpty(original.TargetGateway) ? original.TargetGateway : GetConfigGatewayIp();
+            string target6 = !string.IsNullOrEmpty(original.TargetGatewayIpv6) ? original.TargetGatewayIpv6 : GetNormalizedConfigGatewayIpv6();
+
+            if (!string.IsNullOrEmpty(original.RoutesJson))
+            {
+                return "$ErrorActionPreference='Stop';$idx=" + index + ";" + PowerShellNormalizeFunction()
+                    + "$savedRoutes=ConvertFrom-Json '" + EscapePowerShell(original.RoutesJson) + "';"
+                    + "$target4='" + EscapePowerShell(target4) + "';$target6='" + EscapePowerShell(target6) + "';"
+                    + "$same=" + (sameNetwork ? "$true" : "$false") + ";"
+                    + "foreach($store in @('PersistentStore','ActiveStore')){$routes=@(Get-NetRoute -PolicyStore $store -ErrorAction SilentlyContinue | Where-Object { $_.InterfaceIndex -eq $idx });"
+                    + "foreach($route in $routes){$owned=($route.DestinationPrefix -eq '0.0.0.0/0' -and $route.NextHop -eq $target4) -or ($target6 -and $route.DestinationPrefix -eq '::/0' -and (Normalize-Address $route.NextHop) -eq (Normalize-Address $target6));"
+                    + "$wasOriginal=$same -and @($savedRoutes | Where-Object { $_.PolicyStore -eq $store -and $_.DestinationPrefix -eq $route.DestinationPrefix -and (Normalize-Address $_.NextHop) -eq (Normalize-Address $route.NextHop) }).Count -gt 0;"
+                    + "if($owned -and $route.Protocol -eq 'NetMgmt' -and -not $wasOriginal){throw '目标旁路由仍有残留路由，备份已保留。'}}"
+                    + "if($same){foreach($saved in @($savedRoutes | Where-Object { $_.PolicyStore -eq $store })){if(-not ($routes | Where-Object { $_.DestinationPrefix -eq $saved.DestinationPrefix -and (Normalize-Address $_.NextHop) -eq (Normalize-Address $saved.NextHop) -and $_.RouteMetric -eq $saved.RouteMetric })){throw '原始路由恢复校验失败，备份已保留。'}}}}";
+            }
+
             return "$ErrorActionPreference='Stop';$idx=" + index + ";" + PowerShellNormalizeFunction()
-                + "$savedRoutes=ConvertFrom-Json '" + EscapePowerShell(original.RoutesJson) + "';"
-                + "$target4='" + EscapePowerShell(original.TargetGateway) + "';$target6='" + EscapePowerShell(original.TargetGatewayIpv6) + "';"
-                + "$same=" + (sameNetwork ? "$true" : "$false") + ";"
-                + "foreach($store in @('PersistentStore','ActiveStore')){$routes=@(Get-NetRoute -PolicyStore $store -ErrorAction Stop | Where-Object { $_.InterfaceIndex -eq $idx });"
+                + "$target4='" + EscapePowerShell(target4) + "';$target6='" + EscapePowerShell(target6) + "';"
+                + "foreach($store in @('PersistentStore','ActiveStore')){$routes=@(Get-NetRoute -PolicyStore $store -ErrorAction SilentlyContinue | Where-Object { $_.InterfaceIndex -eq $idx });"
                 + "foreach($route in $routes){$owned=($route.DestinationPrefix -eq '0.0.0.0/0' -and $route.NextHop -eq $target4) -or ($target6 -and $route.DestinationPrefix -eq '::/0' -and (Normalize-Address $route.NextHop) -eq (Normalize-Address $target6));"
-                + "$wasOriginal=$same -and @($savedRoutes | Where-Object { $_.PolicyStore -eq $store -and $_.DestinationPrefix -eq $route.DestinationPrefix -and (Normalize-Address $_.NextHop) -eq (Normalize-Address $route.NextHop) }).Count -gt 0;"
-                + "if($owned -and $route.Protocol -eq 'NetMgmt' -and -not $wasOriginal){throw '目标旁路由仍有残留路由，备份已保留。'}}"
-                + "if($same){foreach($saved in @($savedRoutes | Where-Object { $_.PolicyStore -eq $store })){if(-not ($routes | Where-Object { $_.DestinationPrefix -eq $saved.DestinationPrefix -and (Normalize-Address $_.NextHop) -eq (Normalize-Address $saved.NextHop) -and $_.RouteMetric -eq $saved.RouteMetric })){throw '原始路由恢复校验失败，备份已保留。'}}}}";
+                + "if($owned -and $route.Protocol -eq 'NetMgmt'){throw '目标旁路由仍有残留路由，备份已保留。'}}}"
+                + (sameNetwork && !string.IsNullOrEmpty(original.Gateway) ? "$v4Route=Get-NetRoute -InterfaceIndex $idx -DestinationPrefix '0.0.0.0/0' -ErrorAction SilentlyContinue | Where-Object { $_.NextHop -eq '" + EscapePowerShell(original.Gateway) + "' };if(-not $v4Route){throw '原始默认网关未恢复，备份已保留。'}" : "");
         }
 
         private static void VerifyDnsRestored(OriginalConfig original, int index, bool ipv6)
         {
             string registryFamily = ipv6 ? "Tcpip6" : "Tcpip";
-            bool dhcp = ipv6 ? original.IsIpv6DnsDhcp : original.IsDnsDhcp;
+            List<string> cleanDns = original.DnsServers.FindAll(d => d.Contains(":") == ipv6);
+            bool dhcp = ipv6 ? (original.IsIpv6DnsDhcp || cleanDns.Count == 0) : (original.IsDnsDhcp || cleanDns.Count == 0);
             using (RegistryKey key = Registry.LocalMachine.OpenSubKey(@"SYSTEM\CurrentControlSet\Services\" + registryFamily + @"\Parameters\Interfaces\" + original.InterfaceId))
             {
                 if (key == null) throw new InvalidOperationException("无法校验 DNS 配置，备份已保留。");
-                bool actualDhcp = string.IsNullOrWhiteSpace(key.GetValue("NameServer") as string);
-                if (actualDhcp != dhcp) throw new InvalidOperationException("DNS 获取方式恢复失败，备份已保留。");
+                string nameServer = key.GetValue("NameServer") as string;
+                bool actualDhcp = string.IsNullOrWhiteSpace(nameServer);
+                if (dhcp && !actualDhcp) throw new InvalidOperationException("DNS 获取方式恢复失败（未能重置为 DHCP），备份已保留。");
+                if (!dhcp && actualDhcp) throw new InvalidOperationException("DNS 获取方式恢复失败（未写入静态 DNS），备份已保留。");
             }
             if (dhcp) return;
             RunPowerShell(BuildVerifyDnsCommand(original, index, ipv6));
@@ -2214,12 +2364,13 @@ namespace YuanxinGateway
         private static string PowerShellDnsFunction()
         {
             return "function Set-NetshDnsFamily($family,$idx,[string[]]$addresses){"
-                + "if($null -eq $addresses -or $addresses.Count -eq 0){& netsh interface $family set dnsservers \"name=$idx\" source=static address=none validate=no | Out-Null;if($LASTEXITCODE -ne 0){throw ($family + ' DNS 清除失败');}return;}"
-                + "$first=$addresses[0];"
+                + "$clean=@();if($null -ne $addresses){$clean=@($addresses | ForEach-Object { Normalize-Address $_ } | Where-Object { -not [string]::IsNullOrWhiteSpace($_) });}"
+                + "if($clean.Count -eq 0){& netsh interface $family set dnsservers \"name=$idx\" source=static address=none validate=no | Out-Null;if($LASTEXITCODE -ne 0){throw ($family + ' DNS 清除失败');}return;}"
+                + "$first=$clean[0];"
                 + "& netsh interface $family set dnsservers \"name=$idx\" source=static \"address=$first\" register=primary validate=no | Out-Null;"
                 + "if($LASTEXITCODE -ne 0){throw ($family + ' DNS 写入失败: ' + $first);}"
-                + "for($i=1;$i -lt $addresses.Count;$i++){"
-                + "$address=$addresses[$i];$order=$i + 1;"
+                + "for($i=1;$i -lt $clean.Count;$i++){"
+                + "$address=$clean[$i];$order=$i + 1;"
                 + "& netsh interface $family add dnsservers \"name=$idx\" \"address=$address\" \"index=$order\" validate=no | Out-Null;"
                 + "if($LASTEXITCODE -ne 0){throw ($family + ' DNS 追加失败: ' + $address);}"
                 + "}"
