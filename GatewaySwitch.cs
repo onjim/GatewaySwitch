@@ -11,6 +11,7 @@ using System.Text;
 using System.Threading;
 using System.Threading.Tasks;
 using System.Windows.Forms;
+using System.Xml;
 using Microsoft.Win32;
 
 namespace YuanxinGateway
@@ -20,20 +21,38 @@ namespace YuanxinGateway
         private const string SingleInstanceMutexName = "YuanxinGateway.SingleInstance";
 
         [STAThread]
-        private static void Main()
+        private static void Main(string[] args)
         {
+            bool startMinimized = false;
+            if (args != null && args.Length > 0)
+            {
+                foreach (string arg in args)
+                {
+                    if (string.Equals(arg, "--minimized", StringComparison.OrdinalIgnoreCase) ||
+                        string.Equals(arg, "-minimized", StringComparison.OrdinalIgnoreCase) ||
+                        string.Equals(arg, "/minimized", StringComparison.OrdinalIgnoreCase))
+                    {
+                        startMinimized = true;
+                        break;
+                    }
+                }
+            }
+
             bool createdNew;
             using (Mutex instanceMutex = new Mutex(true, SingleInstanceMutexName, out createdNew))
             {
                 if (!createdNew)
                 {
-                    MainForm.SignalExistingInstance();
+                    if (!startMinimized)
+                    {
+                        MainForm.SignalExistingInstance();
+                    }
                     return;
                 }
 
                 Application.EnableVisualStyles();
                 Application.SetCompatibleTextRenderingDefault(false);
-                Application.Run(new MainForm());
+                Application.Run(new MainForm(startMinimized));
             }
         }
     }
@@ -91,13 +110,18 @@ namespace YuanxinGateway
         private DateTime lastObservationAt;
         private DateTime nextAutoAttempt;
         private int autoFailureCount;
+        private int gatewayHealthFailureCount;
+        private DateTime nextHealthCheck;
+        private string lastNetworkKey;
         private bool isRefreshing;
+        private Task<NetworkSnapshot> snapshotReadTask;
         private bool isTesting;
         private bool isClosing;
         private bool exitRequested;
         private bool exitFlowActive;
         private bool hasOriginalConfig;
         private bool hasValidNetworkState;
+        private bool hasRouteDrift;
         private WifiConfig observedNetwork;
         private float dpiScale = 1F;
         private int progressDesignWidth;
@@ -114,13 +138,24 @@ namespace YuanxinGateway
         private static readonly IntPtr IconBig = new IntPtr(1);
         private static readonly int ShowExistingInstanceMessage = RegisterWindowMessage("YuanxinGateway.ShowExistingInstance");
         private static readonly IntPtr HwndBroadcast = new IntPtr(0xffff);
+        private readonly bool startMinimized;
+        private bool hasShownOnce;
 
-        public MainForm() : this(new SystemGatewayOperations(), null)
+        public MainForm() : this(false)
         {
         }
 
-        internal MainForm(IGatewayOperations operations, Action<string> errorHandler)
+        public MainForm(bool startMinimized) : this(new SystemGatewayOperations(), null, startMinimized)
         {
+        }
+
+        internal MainForm(IGatewayOperations operations, Action<string> errorHandler) : this(operations, errorHandler, false)
+        {
+        }
+
+        internal MainForm(IGatewayOperations operations, Action<string> errorHandler, bool startMinimized)
+        {
+            this.startMinimized = startMinimized;
             gatewayOperations = operations ?? throw new ArgumentNullException(nameof(operations));
             showOperationError = errorHandler ?? (message => MessageBox.Show(this, message, "错误", MessageBoxButtons.OK, MessageBoxIcon.Error));
             Text = "元信旁路由";
@@ -169,7 +204,7 @@ namespace YuanxinGateway
 
             helperLabel = new Label();
             helperLabel.AutoSize = false;
-            helperLabel.Text = "Wi-Fi 网关助手";
+            helperLabel.Text = "无线 / 有线网关助手";
             helperLabel.Font = new Font("Microsoft YaHei UI", 9F, FontStyle.Bold);
             helperLabel.ForeColor = mutedTextColor;
             helperLabel.Location = new Point(30, 58);
@@ -524,6 +559,21 @@ namespace YuanxinGateway
             }
         }
 
+        protected override void SetVisibleCore(bool value)
+        {
+            if (startMinimized && !hasShownOnce)
+            {
+                if (!IsHandleCreated)
+                {
+                    CreateHandle();
+                }
+                base.SetVisibleCore(false);
+                return;
+            }
+
+            base.SetVisibleCore(value);
+        }
+
         protected override void WndProc(ref Message m)
         {
             if (m.Msg == ShowExistingInstanceMessage)
@@ -557,7 +607,7 @@ namespace YuanxinGateway
         private void StopLoading()
         {
             isProcessing = false;
-            powerButton.Enabled = !isRefreshing;
+            powerButton.Enabled = true;
             testButton.Enabled = !isTesting;
             settingsButton.Enabled = !isRefreshing;
             loadingTimer.Stop();
@@ -570,10 +620,11 @@ namespace YuanxinGateway
 
         internal async Task ExecutePowerActionAsync()
         {
-            if (isProcessing || isRefreshing || isClosing || exitFlowActive || exitRequested) return;
+            if (isProcessing || isClosing || exitFlowActive || exitRequested) return;
 
             autoFailureCount = 0;
             nextAutoAttempt = DateTime.MinValue;
+            gatewayHealthFailureCount = 0;
             try
             {
                 StartLoading("正在核对网络状态");
@@ -596,15 +647,19 @@ namespace YuanxinGateway
 
         private async Task<NetworkSnapshot> ReadAndApplySnapshotAsync()
         {
+            // A manual action can join the in-flight refresh without starting another probe.
+            Task<NetworkSnapshot> readTask = snapshotReadTask ??
+                (snapshotReadTask = Task.Run(() => gatewayOperations.GetSnapshot()));
             try
             {
-                NetworkSnapshot snapshot = await Task.Run(() => gatewayOperations.GetSnapshot());
+                NetworkSnapshot snapshot = await readTask;
                 if (snapshot == null) throw new InvalidOperationException("未能读取网络状态，请重试。");
                 if (!isClosing && !IsDisposed)
                 {
                     observedNetwork = snapshot.Network;
                     enabledByApp = snapshot.IsActive;
                     hasOriginalConfig = snapshot.HasOriginal;
+                    hasRouteDrift = snapshot.HasCompetingDefaultRoute;
                     hasValidNetworkState = true;
                     UpdateRouteVisualState();
                 }
@@ -615,6 +670,10 @@ namespace YuanxinGateway
                 hasValidNetworkState = false;
                 if (!isClosing && !IsDisposed) UpdateRouteVisualState();
                 throw;
+            }
+            finally
+            {
+                if (ReferenceEquals(snapshotReadTask, readTask)) snapshotReadTask = null;
             }
         }
 
@@ -636,10 +695,28 @@ namespace YuanxinGateway
             }
             catch (Exception ex)
             {
-                string message = (enable ? "配置旁路由失败：" : "恢复 Wi-Fi 配置失败：") + ex.Message;
+                string message = (enable ? "配置旁路由失败：" : "恢复网络配置失败：") + ex.Message;
                 try { await ReadAndApplySnapshotAsync(); }
                 catch (Exception refreshError) { message += "\n无法确认操作后的状态：" + refreshError.Message; }
                 ReportOperationError(message, automatic);
+                return false;
+            }
+        }
+
+        private async Task<bool> RepairTargetGatewayAsync(string configIp, bool automatic)
+        {
+            try
+            {
+                StartLoading("正在修复旁路由路由");
+                await Task.Run(() => gatewayOperations.RepairTarget(configIp));
+                NetworkSnapshot snapshot = await ReadAndApplySnapshotAsync();
+                if (!snapshot.IsActive || snapshot.HasCompetingDefaultRoute)
+                    throw new InvalidOperationException("操作后的默认路由仍未切换到目标旁路由。");
+                return true;
+            }
+            catch (Exception ex)
+            {
+                ReportOperationError("修复旁路由路由失败：" + ex.Message, automatic);
                 return false;
             }
         }
@@ -655,6 +732,7 @@ namespace YuanxinGateway
             }
             else
             {
+                detailLabel.Text = message;
                 showOperationError(message);
             }
         }
@@ -708,6 +786,7 @@ namespace YuanxinGateway
         {
             if (isProcessing || isRefreshing || isClosing) return;
             refreshTimer.Stop();
+            string previousInterface = GatewayManager.GetConfigInterfaceId();
             using (SettingsForm sf = new SettingsForm())
             {
                 if (sf.ShowDialog(this) == DialogResult.OK)
@@ -715,6 +794,13 @@ namespace YuanxinGateway
                     autoFailureCount = 0;
                     nextAutoAttempt = DateTime.MinValue;
                     pendingSsid = null;
+                    if (!string.Equals(previousInterface, GatewayManager.GetConfigInterfaceId(), StringComparison.OrdinalIgnoreCase))
+                    {
+                        userManuallyDisabled = false;
+                        lastSsid = null;
+                        lastNetworkKey = null;
+                        gatewayHealthFailureCount = 0;
+                    }
                 }
             }
             if (!isClosing && !IsDisposed)
@@ -728,53 +814,115 @@ namespace YuanxinGateway
         {
             if (isProcessing || isRefreshing || isClosing || exitRequested) return;
             isRefreshing = true;
-            powerButton.Enabled = false;
+            bool automaticOperationStarted = false;
             settingsButton.Enabled = false;
             try
             {
                 NetworkSnapshot snapshot = await ReadAndApplySnapshotAsync();
                 if (isClosing || IsDisposed) return;
                 if (exitRequested) return;
+                if (isProcessing) return;
 
                 string currentSsid = snapshot.Ssid;
                 DateTime observedAt = DateTime.UtcNow;
-                if (observedAt < lastObservationAt || (observedAt - lastObservationAt).TotalSeconds > 15) pendingSsid = null;
-                lastObservationAt = observedAt;
-                if (string.IsNullOrEmpty(currentSsid))
+                if (observedAt < lastObservationAt || (observedAt - lastObservationAt).TotalSeconds > 15)
                 {
                     pendingSsid = null;
+                    gatewayHealthFailureCount = 0;
+                }
+                lastObservationAt = observedAt;
+                if (!snapshot.NetworkStateKnown)
+                {
+                    pendingSsid = null;
+                    gatewayHealthFailureCount = 0;
                     return;
                 }
-                if (currentSsid != pendingSsid)
+                string networkKey = snapshot.NetworkKey;
+                if (networkKey != pendingSsid)
                 {
-                    pendingSsid = currentSsid;
+                    pendingSsid = networkKey;
                     pendingSsidSince = DateTime.UtcNow;
+                    gatewayHealthFailureCount = 0;
                     return;
                 }
                 if ((DateTime.UtcNow - pendingSsidSince).TotalSeconds < 10) return;
-                if (currentSsid != lastSsid)
+                if (!string.IsNullOrEmpty(currentSsid) && currentSsid != lastSsid)
                 {
                     if (lastSsid != null) userManuallyDisabled = false;
                     lastSsid = currentSsid;
+                }
+                if (networkKey != lastNetworkKey)
+                {
+                    lastNetworkKey = networkKey;
                     autoFailureCount = 0;
                     nextAutoAttempt = DateTime.MinValue;
+                    nextHealthCheck = DateTime.MinValue;
+                    gatewayHealthFailureCount = 0;
                 }
-                if (!snapshot.AutoEnable || string.IsNullOrEmpty(snapshot.ConfigSsid) ||
-                    autoFailureCount >= 5 || DateTime.UtcNow < nextAutoAttempt) return;
+                if (autoFailureCount >= 5 || DateTime.UtcNow < nextAutoAttempt) return;
 
                 bool success = false;
-                if (hasOriginalConfig && currentSsid != snapshot.ConfigSsid)
+                string notification = null;
+                if (hasOriginalConfig && snapshot.NeedsRestore)
                 {
+                    automaticOperationStarted = true;
                     success = await ChangeGatewayAsync(false, snapshot.GatewayIp, true);
+                    notification = "原网络已断开或变化，已清理原网卡的旁路由配置。";
                 }
-                else if (!enabledByApp && !hasOriginalConfig && currentSsid == snapshot.ConfigSsid && !userManuallyDisabled)
+                else if (hasOriginalConfig && snapshot.CanMaintain)
                 {
+                    if (snapshot.HasCompetingDefaultRoute)
+                    {
+                        automaticOperationStarted = true;
+                        success = await RepairTargetGatewayAsync(snapshot.GatewayIp, true);
+                        if (!success) return;
+                        detailLabel.Text = "已修复重新出现的默认路由，原始备份保持不变。";
+                    }
+                    else if (!snapshot.IsActive)
+                    {
+                        automaticOperationStarted = true;
+                        userManuallyDisabled = true;
+                        success = await ChangeGatewayAsync(false, snapshot.GatewayIp, true);
+                        notification = "旁路由配置发生变化，已恢复原始网络；自动启用已暂停。";
+                    }
+
+                    if (hasOriginalConfig && enabledByApp && DateTime.UtcNow >= nextHealthCheck)
+                    {
+                        automaticOperationStarted = true;
+                        StartLoading("正在检查旁路由连通性");
+                        try
+                        {
+                            bool healthy = await Task.Run(() => gatewayOperations.CheckHealth(snapshot.GatewayIp));
+                            gatewayHealthFailureCount = healthy ? 0 : gatewayHealthFailureCount + 1;
+                            nextHealthCheck = DateTime.UtcNow.AddSeconds(30);
+                        }
+                        catch
+                        {
+                            gatewayHealthFailureCount = 0;
+                            nextHealthCheck = DateTime.UtcNow.AddSeconds(30);
+                            throw;
+                        }
+                        if (gatewayHealthFailureCount >= 3)
+                        {
+                            userManuallyDisabled = true;
+                            success = await ChangeGatewayAsync(false, snapshot.GatewayIp, true);
+                            notification = "旁路由连续三轮连通性检查失败，已恢复原网络；请检查旁路由后手动启用。";
+                        }
+                    }
+                }
+                else if (!enabledByApp && !hasOriginalConfig && snapshot.AutoEnable &&
+                    snapshot.AutoEnableEligible && !userManuallyDisabled)
+                {
+                    automaticOperationStarted = true;
                     success = await ChangeGatewayAsync(true, snapshot.GatewayIp, true);
+                    gatewayHealthFailureCount = 0;
+                    nextHealthCheck = DateTime.UtcNow.AddSeconds(30);
+                    notification = "已自动启用旁路由。";
                 }
                 if (success && !isClosing && !IsDisposed)
                 {
                     autoFailureCount = 0;
-                    trayIcon.ShowBalloonTip(3000, "旁路由助手", enabledByApp ? "已自动启用旁路由。" : "已自动恢复网络。", ToolTipIcon.Info);
+                    if (notification != null) trayIcon.ShowBalloonTip(5000, "旁路由助手", notification, ToolTipIcon.Info);
                 }
             }
             catch (Exception ex)
@@ -784,7 +932,7 @@ namespace YuanxinGateway
             }
             finally
             {
-                if (isProcessing) FinishOperation();
+                if (automaticOperationStarted) FinishOperation();
                 isRefreshing = false;
                 if (!isClosing && !IsDisposed)
                 {
@@ -801,10 +949,18 @@ namespace YuanxinGateway
 
         private void UpdateRouteVisualState()
         {
+            if (isProcessing) return;
             WifiConfig current = observedNetwork;
             string alias = current == null ? "未检测到活动连接" : current.InterfaceAlias;
 
-            if (hasValidNetworkState && enabledByApp)
+            if (hasValidNetworkState && hasRouteDrift)
+            {
+                powerButton.BackColor = Color.FromArgb(50, 53, 60);
+                powerButton.ForeColor = warningColor;
+                routeStateLabel.Text = autoFailureCount >= 5 ? "默认路由仍有冲突（请手动恢复）" : "默认路由发生变化（等待修复）";
+                routeStateLabel.ForeColor = warningColor;
+            }
+            else if (hasValidNetworkState && enabledByApp)
             {
                 powerButton.BackColor = primaryColor;
                 powerButton.ForeColor = Color.FromArgb(0, 46, 106);
@@ -980,6 +1136,7 @@ namespace YuanxinGateway
 
         private void RestoreFromTray()
         {
+            hasShownOnce = true;
             Show();
             if (WindowState == FormWindowState.Minimized)
             {
@@ -1138,6 +1295,7 @@ namespace YuanxinGateway
         public bool IsIpv6DnsDhcp;
         public bool IsWifi;
         public string Ssid;
+        public bool IsConnected;
     }
 
     internal sealed class NetworkSnapshot
@@ -1147,8 +1305,14 @@ namespace YuanxinGateway
         public string Ssid;
         public string ConfigSsid;
         public bool AutoEnable;
+        public bool AutoEnableEligible;
         public bool IsActive;
         public bool HasOriginal;
+        public bool HasCompetingDefaultRoute;
+        public bool NetworkStateKnown;
+        public string NetworkKey;
+        public bool NeedsRestore;
+        public bool CanMaintain;
     }
 
     internal interface IGatewayOperations
@@ -1156,6 +1320,8 @@ namespace YuanxinGateway
         NetworkSnapshot GetSnapshot();
         void Enable(string targetGateway);
         void Restore(string targetGateway);
+        void RepairTarget(string targetGateway);
+        bool CheckHealth(string targetGateway);
     }
 
     internal sealed class SystemGatewayOperations : IGatewayOperations
@@ -1174,12 +1340,38 @@ namespace YuanxinGateway
         {
             GatewayManager.Restore(targetGateway);
         }
+
+        public void RepairTarget(string targetGateway)
+        {
+            GatewayManager.RepairTarget(targetGateway);
+        }
+
+        public bool CheckHealth(string targetGateway)
+        {
+            return GatewayManager.CheckHealth(targetGateway);
+        }
+    }
+
+    internal sealed class AdapterChoice
+    {
+        public string Id;
+        public string Name;
+        public bool IsWifi;
+        public bool IsAvailable;
+        public bool IsConnected;
+
+        public override string ToString()
+        {
+            if (string.IsNullOrEmpty(Id)) return "自动选择（兼容旧设置）";
+            return Name + " · " + (IsAvailable ? (IsWifi ? "无线" : "有线") +
+                (IsConnected ? " / 已连接" : " / 未连接") : "未找到网卡");
+        }
     }
 
     internal sealed class SettingsForm : Form
     {
         private const int BaseWindowWidth = 380;
-        private const int BaseWindowHeight = 370;
+        private const int BaseWindowHeight = 495;
         private const int ReferenceScreenWidth = 1920;
         private const int ReferenceScreenHeight = 1080;
 
@@ -1191,6 +1383,11 @@ namespace YuanxinGateway
         private readonly Color mutedTextColor = Color.FromArgb(194, 198, 214);
 
         private readonly Label lblIp;
+        private readonly Label lblAdapter;
+        private readonly Label adapterHint;
+        private readonly ComboBox adapterSelector;
+        private readonly Button refreshAdaptersButton;
+        private bool loadingAdapters;
         private readonly TextBox txtIp;
         private readonly Label lblIpv6;
         private readonly TextBox txtIpv6;
@@ -1198,6 +1395,7 @@ namespace YuanxinGateway
         private readonly TextBox txtSsid;
         private readonly Button btnGetSsid;
         private readonly CheckBox chkAutoEnable;
+        private readonly CheckBox chkAutoStart;
         private readonly Button btnSave;
         private readonly Button btnCancel;
         private float dpiScale = 1F;
@@ -1216,31 +1414,51 @@ namespace YuanxinGateway
             Font = new Font("Microsoft YaHei UI", 9F);
             SuspendLayout();
 
+            lblAdapter = new Label { Text = "目标网卡：", ForeColor = mutedTextColor };
+            adapterSelector = new ComboBox { DropDownStyle = ComboBoxStyle.DropDownList,
+                BackColor = cardColor, ForeColor = textColor, FlatStyle = FlatStyle.Flat, DropDownWidth = 600 };
+            adapterSelector.Items.Add(new AdapterChoice { Id = "" });
+            string savedInterface = GatewayManager.GetConfigInterfaceId();
+            if (!string.IsNullOrEmpty(savedInterface))
+                adapterSelector.Items.Add(new AdapterChoice { Id = savedInterface, Name = savedInterface });
+            adapterSelector.SelectedIndex = adapterSelector.Items.Count - 1;
+            refreshAdaptersButton = new Button { Text = "刷新", FlatStyle = FlatStyle.Flat,
+                BackColor = cardColor, ForeColor = primaryColor };
+            refreshAdaptersButton.FlatAppearance.BorderColor = cardBorderColor;
+            refreshAdaptersButton.Click += async (sender, args) => await LoadAdaptersAsync();
+            adapterHint = new Label { Text = "切换网卡前，请先恢复已接管的网络。", ForeColor = mutedTextColor };
+
             lblIp = new Label { Text = "旁路由 IP 地址:", Location = new Point(25, 20), Size = new Size(200, 20), ForeColor = mutedTextColor };
             txtIp = new TextBox { Text = GatewayManager.GetConfigGatewayIp(), Location = new Point(25, 42), Size = new Size(310, 25), BackColor = cardColor, ForeColor = textColor, BorderStyle = BorderStyle.FixedSingle };
 
             lblIpv6 = new Label { Text = "旁路由 IPv6 地址 (可选):", Location = new Point(25, 80), Size = new Size(200, 20), ForeColor = mutedTextColor };
             txtIpv6 = new TextBox { Text = GatewayManager.GetConfigGatewayIpv6(), Location = new Point(25, 102), Size = new Size(310, 25), BackColor = cardColor, ForeColor = textColor, BorderStyle = BorderStyle.FixedSingle };
 
-            lblSsid = new Label { Text = "绑定 Wi-Fi SSID (留空表示不限制):", Location = new Point(25, 142), Size = new Size(250, 20), ForeColor = mutedTextColor };
+            lblSsid = new Label { Text = "绑定 Wi-Fi SSID（有线网卡留空）:", Location = new Point(25, 142), Size = new Size(280, 20), ForeColor = mutedTextColor };
             txtSsid = new TextBox { Text = GatewayManager.GetConfigSsid(), Location = new Point(25, 164), Size = new Size(210, 25), BackColor = cardColor, ForeColor = textColor, BorderStyle = BorderStyle.FixedSingle };
             
             btnGetSsid = new Button { Text = "获取当前", Location = new Point(245, 163), Size = new Size(90, 26), FlatStyle = FlatStyle.Flat, BackColor = cardColor, ForeColor = primaryColor };
             btnGetSsid.FlatAppearance.BorderColor = cardBorderColor;
             btnGetSsid.Click += BtnGetSsid_Click;
 
-            chkAutoEnable = new CheckBox { Text = "连上该 Wi-Fi 时自动启用旁路由", Checked = GatewayManager.GetConfigAutoEnable(), Location = new Point(25, 205), Size = new Size(310, 25), ForeColor = textColor };
+            chkAutoEnable = new CheckBox { Text = "连接目标网卡时自动启用旁路由", Checked = GatewayManager.GetConfigAutoEnable(), Location = new Point(25, 205), Size = new Size(310, 25), ForeColor = textColor };
 
-            btnSave = new Button { Text = "保存", Location = new Point(145, 265), Size = new Size(90, 35), FlatStyle = FlatStyle.Flat, BackColor = primaryColor, ForeColor = Color.FromArgb(0, 46, 106) };
+            chkAutoStart = new CheckBox { Text = "开机自启动 (以最高权限静默启动)", Checked = GatewayManager.GetConfigAutoStart(), Location = new Point(25, 238), Size = new Size(310, 25), ForeColor = textColor };
+
+            btnSave = new Button { Text = "保存", Location = new Point(145, 290), Size = new Size(90, 35), FlatStyle = FlatStyle.Flat, BackColor = primaryColor, ForeColor = Color.FromArgb(0, 46, 106) };
             btnSave.FlatAppearance.BorderSize = 0;
             btnSave.Font = new Font("Microsoft YaHei UI", 9F, FontStyle.Bold);
             btnSave.Click += BtnSave_Click;
 
-            btnCancel = new Button { Text = "取消", Location = new Point(245, 265), Size = new Size(90, 35), FlatStyle = FlatStyle.Flat, BackColor = cardColor, ForeColor = mutedTextColor };
+            btnCancel = new Button { Text = "取消", Location = new Point(245, 290), Size = new Size(90, 35), FlatStyle = FlatStyle.Flat, BackColor = cardColor, ForeColor = mutedTextColor };
             btnCancel.FlatAppearance.BorderColor = cardBorderColor;
             btnCancel.Click += (s, e) => Close();
 
             Controls.Add(lblIp);
+            Controls.Add(lblAdapter);
+            Controls.Add(adapterSelector);
+            Controls.Add(refreshAdaptersButton);
+            Controls.Add(adapterHint);
             Controls.Add(txtIp);
             Controls.Add(lblIpv6);
             Controls.Add(txtIpv6);
@@ -1248,8 +1466,12 @@ namespace YuanxinGateway
             Controls.Add(txtSsid);
             Controls.Add(btnGetSsid);
             Controls.Add(chkAutoEnable);
+            Controls.Add(chkAutoStart);
             Controls.Add(btnSave);
             Controls.Add(btnCancel);
+            adapterSelector.SelectedIndexChanged += (sender, args) => UpdateAdapterControls();
+            Shown += async (sender, args) => await LoadAdaptersAsync();
+            UpdateAdapterControls();
             ResumeLayout(false);
             ApplyDpiAwareLayout();
         }
@@ -1279,44 +1501,62 @@ namespace YuanxinGateway
             MaximumSize = scaledWindowSize;
             Font = UiFont(12F, FontStyle.Regular);
 
+            lblAdapter.Font = UiFont(12F, FontStyle.Regular);
+            lblAdapter.Location = ScalePoint(25, 16);
+            lblAdapter.Size = ScaleSize(310, 22);
+            adapterSelector.Font = UiFont(12F, FontStyle.Regular);
+            adapterSelector.Location = ScalePoint(25, 40);
+            adapterSelector.Size = ScaleSize(210, 28);
+            adapterSelector.DropDownWidth = ScaleInt(600);
+            refreshAdaptersButton.Font = UiFont(12F, FontStyle.Regular);
+            refreshAdaptersButton.Location = ScalePoint(245, 39);
+            refreshAdaptersButton.Size = ScaleSize(90, 28);
+            adapterHint.Font = UiFont(11F, FontStyle.Regular);
+            adapterHint.Location = ScalePoint(25, 73);
+            adapterHint.Size = ScaleSize(310, 30);
+
             lblIp.Font = UiFont(12F, FontStyle.Regular);
-            lblIp.Location = ScalePoint(25, 20);
+            lblIp.Location = ScalePoint(25, 110);
             lblIp.Size = ScaleSize(220, 22);
 
             txtIp.Font = UiFont(12F, FontStyle.Regular);
-            txtIp.Location = ScalePoint(25, 42);
+            txtIp.Location = ScalePoint(25, 132);
             txtIp.Size = ScaleSize(310, 26);
 
             lblIpv6.Font = UiFont(12F, FontStyle.Regular);
-            lblIpv6.Location = ScalePoint(25, 80);
+            lblIpv6.Location = ScalePoint(25, 170);
             lblIpv6.Size = ScaleSize(220, 22);
 
             txtIpv6.Font = UiFont(12F, FontStyle.Regular);
-            txtIpv6.Location = ScalePoint(25, 102);
+            txtIpv6.Location = ScalePoint(25, 192);
             txtIpv6.Size = ScaleSize(310, 26);
 
             lblSsid.Font = UiFont(12F, FontStyle.Regular);
-            lblSsid.Location = ScalePoint(25, 142);
+            lblSsid.Location = ScalePoint(25, 232);
             lblSsid.Size = ScaleSize(280, 22);
 
             txtSsid.Font = UiFont(12F, FontStyle.Regular);
-            txtSsid.Location = ScalePoint(25, 164);
+            txtSsid.Location = ScalePoint(25, 254);
             txtSsid.Size = ScaleSize(210, 26);
 
             btnGetSsid.Font = UiFont(12F, FontStyle.Regular);
-            btnGetSsid.Location = ScalePoint(245, 163);
+            btnGetSsid.Location = ScalePoint(245, 253);
             btnGetSsid.Size = ScaleSize(90, 28);
 
             chkAutoEnable.Font = UiFont(12F, FontStyle.Regular);
-            chkAutoEnable.Location = ScalePoint(25, 205);
+            chkAutoEnable.Location = ScalePoint(25, 295);
             chkAutoEnable.Size = ScaleSize(310, 28);
 
+            chkAutoStart.Font = UiFont(12F, FontStyle.Regular);
+            chkAutoStart.Location = ScalePoint(25, 328);
+            chkAutoStart.Size = ScaleSize(310, 28);
+
             btnSave.Font = UiFont(12F, FontStyle.Bold);
-            btnSave.Location = ScalePoint(145, 265);
+            btnSave.Location = ScalePoint(145, 380);
             btnSave.Size = ScaleSize(90, 36);
 
             btnCancel.Font = UiFont(12F, FontStyle.Regular);
-            btnCancel.Location = ScalePoint(245, 265);
+            btnCancel.Location = ScalePoint(245, 380);
             btnCancel.Size = ScaleSize(90, 36);
 
             ResumeLayout(false);
@@ -1380,6 +1620,71 @@ namespace YuanxinGateway
             return new Font(family, Math.Max(1F, pixelSize * dpiScale), style, GraphicsUnit.Pixel);
         }
 
+        private async Task LoadAdaptersAsync()
+        {
+            if (loadingAdapters || IsDisposed) return;
+            loadingAdapters = true;
+            refreshAdaptersButton.Enabled = false;
+            try
+            {
+                List<AdapterChoice> adapters = await Task.Run(() => GatewayManager.GetAdapterChoices());
+                if (IsDisposed || Disposing) return;
+                string selectedId = GatewayManager.GetConfigInterfaceId();
+                adapterSelector.BeginUpdate();
+                adapterSelector.Items.Clear();
+                adapterSelector.Items.Add(new AdapterChoice { Id = "" });
+                foreach (AdapterChoice adapter in adapters) adapterSelector.Items.Add(adapter);
+                int selectedIndex = 0;
+                bool selectedFound = string.IsNullOrEmpty(selectedId);
+                for (int index = 0; index < adapterSelector.Items.Count; index++)
+                {
+                    AdapterChoice choice = adapterSelector.Items[index] as AdapterChoice;
+                    if (choice != null && string.Equals(choice.Id, selectedId, StringComparison.OrdinalIgnoreCase))
+                    {
+                        selectedIndex = index;
+                        selectedFound = true;
+                        break;
+                    }
+                }
+                if (!selectedFound)
+                {
+                    adapterSelector.Items.Add(new AdapterChoice
+                    {
+                        Id = selectedId,
+                        Name = "已保存网卡（当前未找到）",
+                        IsWifi = true,
+                        IsAvailable = false
+                    });
+                    selectedIndex = adapterSelector.Items.Count - 1;
+                }
+                adapterSelector.SelectedIndex = selectedIndex;
+                adapterSelector.EndUpdate();
+                UpdateAdapterControls();
+            }
+            finally
+            {
+                loadingAdapters = false;
+                if (!IsDisposed && !Disposing) refreshAdaptersButton.Enabled = true;
+            }
+        }
+
+        private void UpdateAdapterControls()
+        {
+            AdapterChoice choice = adapterSelector.SelectedItem as AdapterChoice;
+            bool explicitAdapter = choice != null && !string.IsNullOrEmpty(choice.Id);
+            txtSsid.Enabled = !explicitAdapter || choice.IsWifi;
+            btnGetSsid.Enabled = !explicitAdapter || choice.IsWifi;
+            if (explicitAdapter && !choice.IsWifi)
+            {
+                txtSsid.Text = string.Empty;
+                adapterHint.Text = "已选择有线网卡；SSID 限制会自动清空。";
+            }
+            else
+            {
+                adapterHint.Text = explicitAdapter ? "已选择指定网卡；自动切换只作用于此网卡。" : "自动选择活动网卡（兼容旧设置）。";
+            }
+        }
+
         private async void BtnGetSsid_Click(object sender, EventArgs e)
         {
             btnGetSsid.Enabled = false;
@@ -1418,7 +1723,19 @@ namespace YuanxinGateway
                 ipv6 = normalizedIpv6;
             }
 
-            GatewayManager.SaveSettings(ip, ipv6, txtSsid.Text.Trim(), chkAutoEnable.Checked);
+            try
+            {
+                AdapterChoice choice = adapterSelector.SelectedItem as AdapterChoice;
+                string interfaceId = choice == null ? string.Empty : choice.Id;
+                string ssid = choice != null && !choice.IsWifi ? string.Empty : txtSsid.Text.Trim();
+                GatewayManager.SaveSettings(ip, ipv6, ssid, chkAutoEnable.Checked, chkAutoStart.Checked, interfaceId);
+            }
+            catch (Exception ex)
+            {
+                MessageBox.Show(this, "设置开机自启动失败: " + ex.Message, "错误", MessageBoxButtons.OK, MessageBoxIcon.Error);
+                return;
+            }
+
             DialogResult = DialogResult.OK;
             Close();
         }
@@ -1548,6 +1865,52 @@ namespace YuanxinGateway
             return "";
         }
 
+        public static string GetConfigInterfaceId()
+        {
+            using (RegistryKey key = Registry.CurrentUser.OpenSubKey(RegistryPath, false))
+            {
+                if (key != null)
+                {
+                    return Convert.ToString(key.GetValue("ConfigInterfaceId", ""));
+                }
+            }
+            return "";
+        }
+
+        public static List<AdapterChoice> GetAdapterChoices()
+        {
+            List<AdapterChoice> choices = new List<AdapterChoice>();
+            foreach (NetworkInterface item in NetworkInterface.GetAllNetworkInterfaces())
+            {
+                if (item.NetworkInterfaceType != NetworkInterfaceType.Wireless80211 &&
+                    item.NetworkInterfaceType != NetworkInterfaceType.Ethernet)
+                {
+                    continue;
+                }
+
+                string description = (item.Description ?? string.Empty).ToLowerInvariant();
+                if (description.Contains("virtual") || description.Contains("pseudo") ||
+                    description.Contains("loopback") || description.Contains("hyper-v") ||
+                    description.Contains("wsl") || description.Contains("vmware") ||
+                    description.Contains("virtualbox") || description.Contains("vpn"))
+                {
+                    continue;
+                }
+
+                choices.Add(new AdapterChoice
+                {
+                    Id = item.Id,
+                    Name = item.Name,
+                    IsWifi = item.NetworkInterfaceType == NetworkInterfaceType.Wireless80211,
+                    IsAvailable = true,
+                    IsConnected = item.OperationalStatus == OperationalStatus.Up
+                });
+            }
+
+            choices.Sort((left, right) => string.Compare(left.Name, right.Name, StringComparison.OrdinalIgnoreCase));
+            return choices;
+        }
+
         public static bool GetConfigAutoEnable()
         {
             using (RegistryKey key = Registry.CurrentUser.OpenSubKey(RegistryPath, false))
@@ -1560,14 +1923,88 @@ namespace YuanxinGateway
             return true;
         }
 
+        public const string AutoStartTaskName = "GatewaySwitch";
+
+        public static bool IsAutoStartTaskConfigured()
+        {
+            try
+            {
+                RunCommand("schtasks.exe", string.Format("/query /tn \"{0}\"", AutoStartTaskName), 5000);
+                return true;
+            }
+            catch
+            {
+                return false;
+            }
+        }
+
+        public static bool GetConfigAutoStart()
+        {
+            using (RegistryKey key = Registry.CurrentUser.OpenSubKey(RegistryPath, false))
+            {
+                if (key != null)
+                {
+                    object val = key.GetValue("ConfigAutoStart", null);
+                    if (val != null)
+                    {
+                        return Convert.ToInt32(val) == 1;
+                    }
+                }
+            }
+            return IsAutoStartTaskConfigured();
+        }
+
+        public static void SetAutoStart(bool enable)
+        {
+            if (enable)
+            {
+                string exePath = Application.ExecutablePath;
+                string action = QuoteWindowsCommandLineArgument(exePath) + " --minimized";
+                string args = string.Format("/create /tn \"{0}\" /tr {1} /sc onlogon /rl highest /f",
+                    AutoStartTaskName, QuoteWindowsCommandLineArgument(action));
+                RunCommand("schtasks.exe", args, 5000);
+            }
+            else
+            {
+                try
+                {
+                    if (IsAutoStartTaskConfigured())
+                    {
+                        string args = string.Format("/delete /tn \"{0}\" /f", AutoStartTaskName);
+                        RunCommand("schtasks.exe", args, 5000);
+                    }
+                }
+                catch (Exception ex)
+                {
+                    if (!ex.Message.Contains("cannot find") && !ex.Message.Contains("找不到"))
+                    {
+                        throw;
+                    }
+                }
+            }
+        }
+
         public static void SaveSettings(string ip, string ipv6, string ssid, bool autoEnable)
         {
+            SaveSettings(ip, ipv6, ssid, autoEnable, GetConfigAutoStart());
+        }
+
+        public static void SaveSettings(string ip, string ipv6, string ssid, bool autoEnable, bool autoStart)
+        {
+            SaveSettings(ip, ipv6, ssid, autoEnable, autoStart, GetConfigInterfaceId());
+        }
+
+        public static void SaveSettings(string ip, string ipv6, string ssid, bool autoEnable, bool autoStart, string interfaceId)
+        {
+            SetAutoStart(autoStart);
             using (RegistryKey key = Registry.CurrentUser.CreateSubKey(RegistryPath))
             {
                 key.SetValue("ConfigGatewayIp", ip ?? string.Empty, RegistryValueKind.String);
                 key.SetValue("ConfigGatewayIpv6", ipv6 ?? string.Empty, RegistryValueKind.String);
                 key.SetValue("ConfigSsid", ssid ?? string.Empty, RegistryValueKind.String);
                 key.SetValue("ConfigAutoEnable", autoEnable ? 1 : 0, RegistryValueKind.DWord);
+                key.SetValue("ConfigAutoStart", autoStart ? 1 : 0, RegistryValueKind.DWord);
+                key.SetValue("ConfigInterfaceId", interfaceId ?? string.Empty, RegistryValueKind.String);
             }
         }
 
@@ -1575,16 +2012,25 @@ namespace YuanxinGateway
         {
             string interfaceId;
             string ssid = GetActiveWifiSsid(out interfaceId);
+            string configuredInterfaceId = GetConfigInterfaceId();
+            if (!string.IsNullOrEmpty(configuredInterfaceId))
+            {
+                return GetCurrentNetworkConfig(ssid, interfaceId, configuredInterfaceId);
+            }
             return GetCurrentNetworkConfig(ssid, interfaceId);
         }
 
-        private static WifiConfig GetCurrentNetworkConfig(string activeSsid, string activeInterfaceId)
+        private static WifiConfig GetCurrentNetworkConfig(string activeSsid, string activeInterfaceId,
+            string requiredInterfaceId = null)
         {
             List<WifiConfig> candidates = new List<WifiConfig>();
 
             foreach (NetworkInterface item in NetworkInterface.GetAllNetworkInterfaces())
             {
-                if (item.OperationalStatus != OperationalStatus.Up)
+                bool selectedInterface = requiredInterfaceId != null;
+                if (selectedInterface && !string.Equals(item.Id, requiredInterfaceId, StringComparison.OrdinalIgnoreCase))
+                    continue;
+                if (!selectedInterface && item.OperationalStatus != OperationalStatus.Up)
                 {
                     continue;
                 }
@@ -1629,7 +2075,7 @@ namespace YuanxinGateway
                     }
                 }
 
-                if (string.IsNullOrEmpty(address))
+                if (!selectedInterface && string.IsNullOrEmpty(address))
                 {
                     continue;
                 }
@@ -1639,6 +2085,7 @@ namespace YuanxinGateway
                 config.InterfaceId = item.Id;
                 config.InterfaceIndex = ipv4Props.Index;
                 config.IPv4Address = address;
+                config.IsConnected = item.OperationalStatus == OperationalStatus.Up;
                 config.NetworkAddress = networkAddress;
                 config.IsDnsDhcp = true;
                 config.IsIpv6DnsDhcp = true;
@@ -1700,6 +2147,7 @@ namespace YuanxinGateway
                 return null;
             }
 
+            if (requiredInterfaceId != null) return candidates[0];
             if (!string.IsNullOrEmpty(activeSsid))
             {
                 foreach (WifiConfig candidate in candidates)
@@ -1739,18 +2187,79 @@ namespace YuanxinGateway
         {
             string interfaceId;
             string ssid = GetActiveWifiSsid(out interfaceId);
-            WifiConfig current = GetCurrentNetworkConfig(ssid, interfaceId);
+            string configuredInterfaceId = GetConfigInterfaceId();
+            WifiConfig current = string.IsNullOrEmpty(configuredInterfaceId)
+                ? GetCurrentNetworkConfig(ssid, interfaceId)
+                : GetCurrentNetworkConfig(ssid, interfaceId, configuredInterfaceId);
             string targetGateway = GetConfigGatewayIp();
+            bool hasOriginal = OriginalExists();
+            OriginalConfig original = hasOriginal ? LoadOriginal() : null;
+            WifiConfig managed = hasOriginal ? GetOriginalNetwork(original, ssid, interfaceId) : null;
+            WifiConfig observed = hasOriginal ? managed : current;
+            bool known = observed != null && (!observed.IsConnected ||
+                !observed.IsWifi || !string.IsNullOrEmpty(observed.Ssid));
+            bool canMaintain = hasOriginal && known && managed.IsConnected && IsSameNetwork(original, managed);
+            string activeTarget = hasOriginal ? original.TargetGateway : targetGateway;
+            string activeTarget6 = hasOriginal ? original.TargetGatewayIpv6 : GetNormalizedConfigGatewayIpv6();
+            bool isActive = IsTargetActive(activeTarget, observed, activeTarget6);
             return new NetworkSnapshot
             {
                 Ssid = ssid,
-                Network = current,
-                GatewayIp = targetGateway,
+                Network = observed,
+                GatewayIp = activeTarget,
                 ConfigSsid = GetConfigSsid(),
                 AutoEnable = GetConfigAutoEnable(),
-                HasOriginal = OriginalExists(),
-                IsActive = IsTargetActive(targetGateway, current)
+                AutoEnableEligible = !hasOriginal && observed != null && observed.IsConnected &&
+                    (string.IsNullOrEmpty(GetConfigSsid()) ||
+                     (observed.IsWifi && string.Equals(observed.Ssid, GetConfigSsid(), StringComparison.Ordinal))),
+                HasOriginal = hasOriginal,
+                IsActive = isActive,
+                NetworkStateKnown = known,
+                NetworkKey = observed == null ? "missing" : observed.InterfaceId + "|" + observed.IsConnected + "|" + observed.Ssid + "|" + observed.NetworkAddress,
+                NeedsRestore = hasOriginal && known && !canMaintain,
+                CanMaintain = canMaintain,
+                HasCompetingDefaultRoute = canMaintain && HasCompetingDefaultRoute(activeTarget, managed, activeTarget6)
             };
+        }
+
+        public static void RepairTarget(string targetGateway)
+        {
+            OriginalConfig original = LoadOriginal();
+            WifiConfig current = RequireManagedNetwork(original, targetGateway);
+            EnsureNetworkUnchanged(current);
+            RunPowerShell(BuildRepairTargetCommand(current.InterfaceIndex, original.TargetGateway, original.TargetGatewayIpv6));
+            VerifyApplied(current.InterfaceIndex, original.TargetGateway, original.TargetGatewayIpv6);
+            EnsureNetworkUnchanged(current);
+        }
+
+        private static WifiConfig GetOriginalNetwork(OriginalConfig original, string ssid, string wifiInterfaceId)
+        {
+            string savedId = original.InterfaceId;
+            if (string.IsNullOrEmpty(savedId))
+            {
+                foreach (NetworkInterface adapter in NetworkInterface.GetAllNetworkInterfaces())
+                {
+                    if (string.Equals(adapter.Name, original.InterfaceAlias, StringComparison.OrdinalIgnoreCase))
+                    {
+                        savedId = adapter.Id;
+                        break;
+                    }
+                }
+            }
+            if (string.IsNullOrEmpty(savedId)) return null;
+            return GetCurrentNetworkConfig(ssid, wifiInterfaceId, savedId);
+        }
+
+        private static WifiConfig RequireManagedNetwork(OriginalConfig original, string targetGateway)
+        {
+            string wifiInterfaceId;
+            string ssid = GetActiveWifiSsid(out wifiInterfaceId);
+            WifiConfig current = GetOriginalNetwork(original, ssid, wifiInterfaceId);
+            if (!OriginalExists() || !AddressesEqual(original.TargetGateway, targetGateway) ||
+                current == null || !current.IsConnected || !IsSameNetwork(original, current) ||
+                (current.IsWifi && string.IsNullOrEmpty(current.Ssid)))
+                throw new InvalidOperationException("备份网卡或网络已变化，已停止路由守护并保留备份。");
+            return current;
         }
 
         public static bool HasPendingRestore()
@@ -1760,6 +2269,11 @@ namespace YuanxinGateway
 
         private static bool IsTargetActive(string targetGateway, WifiConfig current)
         {
+            return IsTargetActive(targetGateway, current, GetNormalizedConfigGatewayIpv6());
+        }
+
+        private static bool IsTargetActive(string targetGateway, WifiConfig current, string targetGatewayIpv6)
+        {
             if (current == null)
             {
                 return false;
@@ -1768,7 +2282,6 @@ namespace YuanxinGateway
             bool dnsMatch = ContainsAddress(current.DnsServers, targetGateway);
             if (!dnsMatch) return false;
 
-            string targetGatewayIpv6 = GetNormalizedConfigGatewayIpv6();
             if (!string.IsNullOrEmpty(targetGatewayIpv6) && !ContainsAddress(current.DnsServers, targetGatewayIpv6)) return false;
             bool gatewayMatch = AddressesEqual(current.Gateway, targetGateway) ||
                 HasDefaultRoute(current.InterfaceIndex, "0.0.0.0/0", targetGateway);
@@ -1802,6 +2315,9 @@ namespace YuanxinGateway
             if (!string.IsNullOrEmpty(configuredSsid) && current.Ssid != configuredSsid)
                 throw new InvalidOperationException("当前 Wi-Fi 与指定网络不一致，已停止修改网络。");
             if (string.IsNullOrEmpty(current.Gateway)) throw new InvalidOperationException("当前网络没有 IPv4 默认网关，请先恢复正常网络连接。");
+            if (AddressesEqual(current.Gateway, targetGateway) ||
+                HasDefaultRoute(current.InterfaceIndex, "0.0.0.0/0", targetGateway))
+                throw new InvalidOperationException("当前已有目标旁路由默认路由，不能将旁路由配置再次备份为原网络。请先恢复原网络。");
             SaveOriginal(current, targetGateway, targetGatewayIpv6);
 
             bool applyStarted = false;
@@ -1838,10 +2354,11 @@ namespace YuanxinGateway
                 + "$ErrorActionPreference='Stop';"
                 + PowerShellNormalizeFunction()
                 + PowerShellDnsFunction()
+                + "$gwNorm=Normalize-Address $gw;"
                 + "foreach($store in @('ActiveStore','PersistentStore')){"
                 + "Get-NetRoute -PolicyStore $store -ErrorAction Stop | Where-Object { $_.InterfaceIndex -eq $idx -and $_.DestinationPrefix -eq '0.0.0.0/0' } | Remove-NetRoute -Confirm:$false -ErrorAction Stop;"
                 + "}"
-                + "New-NetRoute -InterfaceIndex $idx -DestinationPrefix '0.0.0.0/0' -NextHop $gw -RouteMetric 1 -ErrorAction Stop;";
+                + "New-NetRoute -InterfaceIndex $idx -DestinationPrefix '0.0.0.0/0' -NextHop $gw -RouteMetric 0 -ErrorAction Stop;";
 
             if (!string.IsNullOrEmpty(targetGatewayIpv6))
             {
@@ -1850,7 +2367,7 @@ namespace YuanxinGateway
                     + "foreach($store in @('ActiveStore','PersistentStore')){Get-NetRoute -PolicyStore $store -ErrorAction Stop | Where-Object { $_.InterfaceIndex -eq $idx -and $_.DestinationPrefix -eq '::/0' } | Remove-NetRoute -Confirm:$false -ErrorAction Stop;}"
                     + "$gw6Scoped=Add-ScopeIfNeeded $gw6 $idx;"
                     + "$gw6Norm=Normalize-Address $gw6;"
-                    + "try{New-NetRoute -InterfaceIndex $idx -DestinationPrefix '::/0' -NextHop $gw6 -RouteMetric 1 -ErrorAction Stop;}catch{New-NetRoute -InterfaceIndex $idx -DestinationPrefix '::/0' -NextHop $gw6Scoped -RouteMetric 1 -ErrorAction Stop;}"
+                    + "try{New-NetRoute -InterfaceIndex $idx -DestinationPrefix '::/0' -NextHop $gw6 -RouteMetric 0 -ErrorAction Stop;}catch{New-NetRoute -InterfaceIndex $idx -DestinationPrefix '::/0' -NextHop $gw6Scoped -RouteMetric 0 -ErrorAction Stop;}"
                     + "Set-StaticDns $idx @($gw) @($gw6);";
             }
             else
@@ -1859,9 +2376,48 @@ namespace YuanxinGateway
             }
 
             command += "Clear-DnsClientCache -ErrorAction SilentlyContinue;"
-                + "Register-DnsClient -ErrorAction SilentlyContinue;";
+                + "Register-DnsClient -ErrorAction SilentlyContinue;"
+                // DHCP/network reconfiguration can recreate the original default route.
+                + "foreach($store in @('ActiveStore','PersistentStore')){"
+                + "Get-NetRoute -PolicyStore $store -ErrorAction SilentlyContinue | "
+                + "Where-Object { $_.InterfaceIndex -eq $idx -and $_.DestinationPrefix -eq '0.0.0.0/0' -and (Normalize-Address $_.NextHop) -ne $gwNorm } | "
+                + "Remove-NetRoute -Confirm:$false -ErrorAction SilentlyContinue;"
+                + "};";
+
+            if (!string.IsNullOrEmpty(targetGatewayIpv6))
+            {
+                command += "foreach($store in @('ActiveStore','PersistentStore')){"
+                    + "Get-NetRoute -PolicyStore $store -ErrorAction SilentlyContinue | "
+                    + "Where-Object { $_.InterfaceIndex -eq $idx -and $_.DestinationPrefix -eq '::/0' -and (Normalize-Address $_.NextHop) -ne $gw6Norm } | "
+                    + "Remove-NetRoute -Confirm:$false -ErrorAction SilentlyContinue;"
+                    + "};";
+            }
 
             return command;
+        }
+
+        private static string RouteGuardSetup(int interfaceIndex, string targetGateway, string targetGatewayIpv6)
+        {
+            return "$ErrorActionPreference='Stop';$idx=" + interfaceIndex + ";"
+                + PowerShellNormalizeFunction()
+                + "$families=@(@{Prefix='0.0.0.0/0';Target='" + EscapePowerShell(targetGateway) + "'}"
+                + (string.IsNullOrEmpty(targetGatewayIpv6) ? "" : ",@{Prefix='::/0';Target='" + EscapePowerShell(targetGatewayIpv6) + "'}")
+                + ");";
+        }
+
+        private static string BuildRepairTargetCommand(int interfaceIndex, string targetGateway, string targetGatewayIpv6)
+        {
+            return RouteGuardSetup(interfaceIndex, targetGateway, targetGatewayIpv6)
+                + "foreach($family in $families){$prefix=$family.Prefix;$targetNorm=Normalize-Address $family.Target;"
+                + "$active=@(Get-NetRoute -PolicyStore ActiveStore -ErrorAction Stop | Where-Object { $_.InterfaceIndex -eq $idx -and $_.DestinationPrefix -eq $prefix -and (Normalize-Address $_.NextHop) -eq $targetNorm });"
+                + "if($active.Count -eq 0){$hop=Add-ScopeIfNeeded $family.Target $idx;New-NetRoute -InterfaceIndex $idx -DestinationPrefix $prefix -NextHop $hop -RouteMetric 0 -PolicyStore ActiveStore -ErrorAction Stop | Out-Null;}"
+                + "$active=@(Get-NetRoute -PolicyStore ActiveStore -ErrorAction Stop | Where-Object { $_.InterfaceIndex -eq $idx -and $_.DestinationPrefix -eq $prefix -and (Normalize-Address $_.NextHop) -eq $targetNorm });"
+                + "if($active.Count -eq 0){throw '未能建立目标路由，已保留其他默认路由。'}"
+                + "foreach($store in @('PersistentStore','ActiveStore')){"
+                + "$routes=@(Get-NetRoute -PolicyStore $store -ErrorAction Stop | Where-Object { $_.InterfaceIndex -eq $idx -and $_.DestinationPrefix -eq $prefix });"
+                + "foreach($route in $routes){if((Normalize-Address $route.NextHop) -eq $targetNorm){"
+                + "if($route.RouteMetric -ne 0){$route | Set-NetRoute -RouteMetric 0 -Confirm:$false -ErrorAction Stop | Out-Null;}"
+                + "}else{Remove-NetRoute -PolicyStore $store -InterfaceIndex $idx -DestinationPrefix $prefix -NextHop $route.NextHop -Confirm:$false -ErrorAction Stop;}}}}";
         }
 
         public static void Restore(string targetGateway)
@@ -1871,13 +2427,15 @@ namespace YuanxinGateway
             {
                 throw new InvalidOperationException("没有可恢复的备份配置。");
             }
-            WifiConfig current = GetCurrentNetworkConfig();
-            int index = ResolveCurrentInterfaceIndex(original, current);
+            string wifiInterfaceId;
+            string ssid = GetActiveWifiSsid(out wifiInterfaceId);
+            WifiConfig current = GetOriginalNetwork(original, ssid, wifiInterfaceId);
+            int index = current == null ? 0 : current.InterfaceIndex;
             if (index <= 0 || current == null)
             {
-                throw new InvalidOperationException("原网卡未连接，已保留备份；请连接原网卡后重试。");
+                throw new InvalidOperationException("原网卡不存在，已保留备份；不会修改其他网卡，请接回原网卡后重试。");
             }
-            if (original.IsWifi && string.IsNullOrEmpty(current.Ssid))
+            if (current.IsWifi && current.IsConnected && string.IsNullOrEmpty(current.Ssid))
             {
                 throw new InvalidOperationException("无法确认当前 Wi-Fi，暂不恢复，备份已保留。");
             }
@@ -1890,6 +2448,7 @@ namespace YuanxinGateway
             EnsureNetworkUnchanged(current);
             RunPowerShell(BuildRestoreCommand(original, index, sameNetwork));
             EnsureNetworkUnchanged(current);
+            original.InterfaceId = current.InterfaceId;
             VerifyRestored(original, index, sameNetwork);
             EnsureNetworkUnchanged(current);
             ClearOriginal();
@@ -1898,20 +2457,38 @@ namespace YuanxinGateway
         private static string BuildRestoreCommand(OriginalConfig original, int index, bool sameNetwork)
         {
             string targetGateway = !string.IsNullOrEmpty(original.TargetGateway) ? original.TargetGateway : GetConfigGatewayIp();
-            string targetGatewayIpv6 = !string.IsNullOrEmpty(original.TargetGatewayIpv6) ? original.TargetGatewayIpv6 : GetNormalizedConfigGatewayIpv6();
+            string targetGatewayIpv6 = original.TargetGatewayIpv6 ?? string.Empty;
             bool restoreIpv6 = !string.IsNullOrEmpty(targetGatewayIpv6);
 
             string command = "$ErrorActionPreference='Stop';$idx=" + index + ";"
                 + "$target='" + EscapePowerShell(targetGateway) + "';"
                 + PowerShellNormalizeFunction()
                 + PowerShellDnsFunction()
-                + "foreach($store in @('ActiveStore','PersistentStore')){Get-NetRoute -PolicyStore $store -ErrorAction SilentlyContinue | Where-Object { $_.InterfaceIndex -eq $idx -and $_.DestinationPrefix -eq '0.0.0.0/0' -and (Normalize-Address $_.NextHop) -eq (Normalize-Address $target) -and $_.Protocol -eq 'NetMgmt' } | Remove-NetRoute -Confirm:$false -ErrorAction SilentlyContinue;}";
+                + (original.ExcludeTargetRoutes ? SavedRoutesCommand(original)
+                    + "if(-not ($savedRoutes | Where-Object { $_.DestinationPrefix -eq '0.0.0.0/0' })){throw '备份只有旁路由网关，无法确定原网关；已停止恢复并保留备份。'};" : "")
+                + "function Remove-TargetRoutes($prefix,$targetNorm){"
+                + "for($attempt=0;$attempt -lt 3;$attempt++){"
+                + "$found=$false;"
+                + "foreach($store in @('PersistentStore','ActiveStore')){"
+                + "$routes=@(Get-NetRoute -PolicyStore $store -ErrorAction Stop | "
+                + "Where-Object { $_.InterfaceIndex -eq $idx -and $_.DestinationPrefix -eq $prefix -and (Normalize-Address $_.NextHop) -eq $targetNorm });"
+                + "foreach($route in $routes){$found=$true;"
+                + "Remove-NetRoute -PolicyStore $store -InterfaceIndex $idx -DestinationPrefix $prefix -NextHop $route.NextHop -Confirm:$false -ErrorAction Stop;}"
+                + "}"
+                + "if(-not $found){break;}"
+                + "Start-Sleep -Milliseconds 100;"
+                + "}"
+                + "$remaining=@(foreach($store in @('PersistentStore','ActiveStore')){Get-NetRoute -PolicyStore $store -ErrorAction Stop | "
+                + "Where-Object { $_.InterfaceIndex -eq $idx -and $_.DestinationPrefix -eq $prefix -and (Normalize-Address $_.NextHop) -eq $targetNorm }});"
+                + "if($remaining.Count -gt 0){throw ('无法删除目标默认路由 ' + $prefix + ': ' + (($remaining | ForEach-Object { $_.NextHop }) -join ', '))};"
+                + "};"
+                + "Remove-TargetRoutes '0.0.0.0/0' (Normalize-Address $target);";
 
             if (!string.IsNullOrEmpty(targetGatewayIpv6))
             {
                 command += "$target6='" + EscapePowerShell(targetGatewayIpv6) + "';"
                     + "$target6Norm=Normalize-Address $target6;"
-                    + "foreach($store in @('ActiveStore','PersistentStore')){Get-NetRoute -PolicyStore $store -ErrorAction SilentlyContinue | Where-Object { $_.InterfaceIndex -eq $idx -and $_.DestinationPrefix -eq '::/0' -and (Normalize-Address $_.NextHop) -eq $target6Norm -and $_.Protocol -eq 'NetMgmt' } | Remove-NetRoute -Confirm:$false -ErrorAction SilentlyContinue;}";
+                    + "Remove-TargetRoutes '::/0' $target6Norm;";
             }
 
             if (sameNetwork)
@@ -1933,6 +2510,12 @@ namespace YuanxinGateway
                 command += (useDhcpV6 ? "Reset-DnsFamily 'ipv6' $idx;" : "Set-NetshDnsFamily 'ipv6' $idx $dns6;");
             }
 
+            // DHCP can recreate a default route while the interface is being reset.
+            command += "Remove-TargetRoutes '0.0.0.0/0' (Normalize-Address $target);";
+            if (restoreIpv6)
+            {
+                command += "Remove-TargetRoutes '::/0' $target6Norm;";
+            }
             command += "Clear-DnsClientCache -ErrorAction SilentlyContinue;"
                 + "Register-DnsClient -ErrorAction SilentlyContinue;";
 
@@ -2071,71 +2654,44 @@ namespace YuanxinGateway
                     config.DnsServers.RemoveAll(d => d == normTarget4 || d == normTarget6);
                 }
             }
+            RepairTargetBackup(config);
             return config;
         }
 
-        private static int ResolveCurrentInterfaceIndex(OriginalConfig original, WifiConfig current)
+        private static void RepairTargetBackup(OriginalConfig config)
         {
-            if (!string.IsNullOrEmpty(original.InterfaceId))
-            {
-                foreach (NetworkInterface item in NetworkInterface.GetAllNetworkInterfaces())
-                {
-                    try
-                    {
-                        IPInterfaceProperties props = item.GetIPProperties();
-                        IPv4InterfaceProperties ipv4Props = props.GetIPv4Properties();
-                        if (ipv4Props == null)
-                        {
-                            continue;
-                        }
+            config.ExcludeTargetRoutes = !string.IsNullOrEmpty(config.TargetGateway) &&
+                AddressesEqual(config.Gateway, config.TargetGateway);
+            if (!config.ExcludeTargetRoutes) return;
 
-                        bool idMatch = !string.IsNullOrEmpty(original.InterfaceId) &&
-                            string.Equals(item.Id, original.InterfaceId, StringComparison.OrdinalIgnoreCase);
-                        if (idMatch)
-                        {
-                            return ipv4Props.Index;
-                        }
-                    }
-                    catch
-                    {
-                    }
-                }
-            }
+            // An interrupted/older enable can capture its own target as the original.
+            // Keep the stored backup intact; use only non-target settings for recovery.
+            string target4 = NormalizeAddressText(config.TargetGateway);
+            string target6 = NormalizeAddressText(config.TargetGatewayIpv6);
+            config.DnsServers.RemoveAll(d => NormalizeAddressText(d) == target4 ||
+                (!string.IsNullOrEmpty(target6) && NormalizeAddressText(d) == target6));
+            if (!config.DnsServers.Exists(d => !d.Contains(":"))) config.IsDnsDhcp = true;
+            if (!config.DnsServers.Exists(d => d.Contains(":"))) config.IsIpv6DnsDhcp = true;
+        }
 
-            if (!string.IsNullOrEmpty(original.InterfaceAlias))
-            {
-                foreach (NetworkInterface item in NetworkInterface.GetAllNetworkInterfaces())
-                {
-                    try
-                    {
-                        IPInterfaceProperties props = item.GetIPProperties();
-                        IPv4InterfaceProperties ipv4Props = props.GetIPv4Properties();
-                        if (ipv4Props == null)
-                        {
-                            continue;
-                        }
-
-                        if (string.Equals(item.Name, original.InterfaceAlias, StringComparison.OrdinalIgnoreCase))
-                        {
-                            return ipv4Props.Index;
-                        }
-                    }
-                    catch
-                    {
-                    }
-                }
-            }
-
-            return current != null ? current.InterfaceIndex : 0;
+        private static string SavedRoutesCommand(OriginalConfig original)
+        {
+            string command = "$savedRoutes=ConvertFrom-Json '" + EscapePowerShell(original.RoutesJson) + "';";
+            return command
+                + "$backupTarget4='" + EscapePowerShell(NormalizeAddressText(original.TargetGateway)) + "';"
+                + "$backupTarget6='" + EscapePowerShell(NormalizeAddressText(original.TargetGatewayIpv6)) + "';"
+                + "$savedRoutes=@($savedRoutes | Where-Object {"
+                + "-not (($_.DestinationPrefix -eq '0.0.0.0/0' -and $backupTarget4 -and (Normalize-Address $_.NextHop) -eq $backupTarget4)"
+                + " -or ($backupTarget6 -and $_.DestinationPrefix -eq '::/0' -and (Normalize-Address $_.NextHop) -eq $backupTarget6)) });";
         }
 
         private static bool IsSameNetwork(OriginalConfig original, WifiConfig current)
         {
-            if (current == null) return false;
+            if (current == null || !current.IsConnected) return false;
 
             bool idMatch = !string.IsNullOrEmpty(original.InterfaceId) &&
                 string.Equals(original.InterfaceId, current.InterfaceId, StringComparison.OrdinalIgnoreCase);
-            if (!idMatch && !string.IsNullOrEmpty(original.InterfaceAlias))
+            if (string.IsNullOrEmpty(original.InterfaceId) && !string.IsNullOrEmpty(original.InterfaceAlias))
             {
                 idMatch = string.Equals(original.InterfaceAlias, current.InterfaceAlias, StringComparison.OrdinalIgnoreCase);
             }
@@ -2153,7 +2709,7 @@ namespace YuanxinGateway
                 string expectedSsid = !string.IsNullOrEmpty(original.Ssid) ? original.Ssid : GetConfigSsid();
                 if (!string.IsNullOrEmpty(expectedSsid) && !string.IsNullOrEmpty(current.Ssid))
                 {
-                    return string.Equals(expectedSsid, current.Ssid, StringComparison.OrdinalIgnoreCase);
+                    return string.Equals(expectedSsid, current.Ssid, StringComparison.Ordinal);
                 }
             }
             return true;
@@ -2161,10 +2717,13 @@ namespace YuanxinGateway
 
         private static void EnsureNetworkUnchanged(WifiConfig expected)
         {
-            WifiConfig current = GetCurrentNetworkConfig();
+            string wifiInterfaceId;
+            string ssid = GetActiveWifiSsid(out wifiInterfaceId);
+            WifiConfig current = GetCurrentNetworkConfig(ssid, wifiInterfaceId, expected.InterfaceId);
             if (current == null || !string.Equals(expected.InterfaceId, current.InterfaceId, StringComparison.OrdinalIgnoreCase) ||
+                expected.IsConnected != current.IsConnected ||
                 expected.NetworkAddress != current.NetworkAddress || expected.IsWifi != current.IsWifi ||
-                (expected.IsWifi && !string.IsNullOrEmpty(expected.Ssid) && (string.IsNullOrEmpty(current.Ssid) || !string.Equals(expected.Ssid, current.Ssid, StringComparison.OrdinalIgnoreCase))))
+                (expected.IsWifi && !string.IsNullOrEmpty(expected.Ssid) && (string.IsNullOrEmpty(current.Ssid) || !string.Equals(expected.Ssid, current.Ssid, StringComparison.Ordinal))))
                 throw new InvalidOperationException("操作期间网络已变化，已停止处理并保留备份。");
         }
 
@@ -2172,10 +2731,10 @@ namespace YuanxinGateway
         {
             if (!string.IsNullOrEmpty(original.RoutesJson))
             {
-                return "$savedRoutes=ConvertFrom-Json '" + EscapePowerShell(original.RoutesJson) + "';"
+                return SavedRoutesCommand(original)
                     + "foreach($saved in $savedRoutes){$next=Add-ScopeIfNeeded $saved.NextHop $idx;"
                     + "$existing=@(Get-NetRoute -PolicyStore $saved.PolicyStore -ErrorAction SilentlyContinue | Where-Object { $_.InterfaceIndex -eq $idx -and $_.DestinationPrefix -eq $saved.DestinationPrefix -and (Normalize-Address $_.NextHop) -eq (Normalize-Address $saved.NextHop) });"
-                    + "if($existing.Count -eq 0){$options=@{InterfaceIndex=$idx;DestinationPrefix=$saved.DestinationPrefix;NextHop=$next;RouteMetric=$saved.RouteMetric;ErrorAction='Stop'};if($saved.PolicyStore -eq 'ActiveStore'){$options.PolicyStore='ActiveStore'};New-NetRoute @options | Out-Null;}"
+                    + "if($existing.Count -eq 0){$options=@{InterfaceIndex=$idx;DestinationPrefix=$saved.DestinationPrefix;NextHop=$next;RouteMetric=$saved.RouteMetric;ErrorAction='Stop'};if($saved.PolicyStore -eq 'ActiveStore' -or $saved.PolicyStore -eq 'PersistentStore'){$options.PolicyStore=$saved.PolicyStore};New-NetRoute @options | Out-Null;}"
                     + "else{$existing | Where-Object { $_.RouteMetric -ne $saved.RouteMetric } | Set-NetRoute -RouteMetric $saved.RouteMetric -Confirm:$false -ErrorAction Stop | Out-Null;}}";
             }
 
@@ -2211,18 +2770,18 @@ namespace YuanxinGateway
         private static string BuildVerifyRoutesCommand(OriginalConfig original, int index, bool sameNetwork)
         {
             string target4 = !string.IsNullOrEmpty(original.TargetGateway) ? original.TargetGateway : GetConfigGatewayIp();
-            string target6 = !string.IsNullOrEmpty(original.TargetGatewayIpv6) ? original.TargetGatewayIpv6 : GetNormalizedConfigGatewayIpv6();
+            string target6 = original.TargetGatewayIpv6 ?? string.Empty;
 
             if (!string.IsNullOrEmpty(original.RoutesJson))
             {
                 return "$ErrorActionPreference='Stop';$idx=" + index + ";" + PowerShellNormalizeFunction()
-                    + "$savedRoutes=ConvertFrom-Json '" + EscapePowerShell(original.RoutesJson) + "';"
+                    + SavedRoutesCommand(original)
                     + "$target4='" + EscapePowerShell(target4) + "';$target6='" + EscapePowerShell(target6) + "';"
                     + "$same=" + (sameNetwork ? "$true" : "$false") + ";"
                     + "foreach($store in @('PersistentStore','ActiveStore')){$routes=@(Get-NetRoute -PolicyStore $store -ErrorAction SilentlyContinue | Where-Object { $_.InterfaceIndex -eq $idx });"
                     + "foreach($route in $routes){$owned=($route.DestinationPrefix -eq '0.0.0.0/0' -and $route.NextHop -eq $target4) -or ($target6 -and $route.DestinationPrefix -eq '::/0' -and (Normalize-Address $route.NextHop) -eq (Normalize-Address $target6));"
                     + "$wasOriginal=$same -and @($savedRoutes | Where-Object { $_.PolicyStore -eq $store -and $_.DestinationPrefix -eq $route.DestinationPrefix -and (Normalize-Address $_.NextHop) -eq (Normalize-Address $route.NextHop) }).Count -gt 0;"
-                    + "if($owned -and $route.Protocol -eq 'NetMgmt' -and -not $wasOriginal){throw '目标旁路由仍有残留路由，备份已保留。'}}"
+                    + "if($owned -and -not $wasOriginal){throw '目标旁路由仍有残留路由，备份已保留。'}}"
                     + "if($same){foreach($saved in @($savedRoutes | Where-Object { $_.PolicyStore -eq $store })){if(-not ($routes | Where-Object { $_.DestinationPrefix -eq $saved.DestinationPrefix -and (Normalize-Address $_.NextHop) -eq (Normalize-Address $saved.NextHop) -and $_.RouteMetric -eq $saved.RouteMetric })){throw '原始路由恢复校验失败，备份已保留。'}}}}";
             }
 
@@ -2230,7 +2789,7 @@ namespace YuanxinGateway
                 + "$target4='" + EscapePowerShell(target4) + "';$target6='" + EscapePowerShell(target6) + "';"
                 + "foreach($store in @('PersistentStore','ActiveStore')){$routes=@(Get-NetRoute -PolicyStore $store -ErrorAction SilentlyContinue | Where-Object { $_.InterfaceIndex -eq $idx });"
                 + "foreach($route in $routes){$owned=($route.DestinationPrefix -eq '0.0.0.0/0' -and $route.NextHop -eq $target4) -or ($target6 -and $route.DestinationPrefix -eq '::/0' -and (Normalize-Address $route.NextHop) -eq (Normalize-Address $target6));"
-                + "if($owned -and $route.Protocol -eq 'NetMgmt'){throw '目标旁路由仍有残留路由，备份已保留。'}}}"
+                + "if($owned){throw '目标旁路由仍有残留路由，备份已保留。'}}}"
                 + (sameNetwork && !string.IsNullOrEmpty(original.Gateway) ? "$v4Route=Get-NetRoute -InterfaceIndex $idx -DestinationPrefix '0.0.0.0/0' -ErrorAction SilentlyContinue | Where-Object { $_.NextHop -eq '" + EscapePowerShell(original.Gateway) + "' };if(-not $v4Route){throw '原始默认网关未恢复，备份已保留。'}" : "");
         }
 
@@ -2385,16 +2944,22 @@ namespace YuanxinGateway
                 + "$gw='" + EscapePowerShell(targetGateway) + "';"
                 + PowerShellNormalizeFunction()
                 + "$dns=@((Get-DnsClientServerAddress -InterfaceIndex $idx -ErrorAction Stop).ServerAddresses | ForEach-Object { Normalize-Address $_ });"
-                + "$v4Route=Get-NetRoute -InterfaceIndex $idx -DestinationPrefix '0.0.0.0/0' -ErrorAction SilentlyContinue | Where-Object { $_.NextHop -eq $gw };"
+                + "$v4Routes=@(Get-NetRoute -PolicyStore ActiveStore -InterfaceIndex $idx -DestinationPrefix '0.0.0.0/0' -ErrorAction SilentlyContinue);"
+                + "$v4Route=$v4Routes | Where-Object { (Normalize-Address $_.NextHop) -eq (Normalize-Address $gw) } | Select-Object -First 1;"
                 + "if(-not $v4Route){throw 'IPv4 默认网关未切换到目标地址。'}"
+                + "$unexpectedV4=$v4Routes | Where-Object { (Normalize-Address $_.NextHop) -ne (Normalize-Address $gw) };"
+                + "if($unexpectedV4){throw ('IPv4 默认路由仍存在其他网关: ' + (($unexpectedV4 | ForEach-Object { $_.NextHop }) -join ', '))}"
                 + "if(-not ($dns -contains (Normalize-Address $gw))){throw 'DNS 未包含目标 IPv4 地址。'}";
 
             if (!string.IsNullOrEmpty(targetGatewayIpv6))
             {
                 command += "$gw6='" + EscapePowerShell(targetGatewayIpv6) + "';"
                     + "$gw6Norm=Normalize-Address $gw6;"
-                    + "$v6Route=Get-NetRoute -InterfaceIndex $idx -DestinationPrefix '::/0' -ErrorAction SilentlyContinue | Where-Object { (Normalize-Address $_.NextHop) -eq $gw6Norm };"
+                    + "$v6Routes=@(Get-NetRoute -PolicyStore ActiveStore -InterfaceIndex $idx -DestinationPrefix '::/0' -ErrorAction SilentlyContinue);"
+                    + "$v6Route=$v6Routes | Where-Object { (Normalize-Address $_.NextHop) -eq $gw6Norm } | Select-Object -First 1;"
                     + "if(-not $v6Route){throw 'IPv6 默认网关未切换到目标地址。'}"
+                    + "$unexpectedV6=$v6Routes | Where-Object { (Normalize-Address $_.NextHop) -ne $gw6Norm };"
+                    + "if($unexpectedV6){throw ('IPv6 默认路由仍存在其他网关: ' + (($unexpectedV6 | ForEach-Object { $_.NextHop }) -join ', '))}"
                     + "if(-not ($dns -contains $gw6Norm)){throw 'DNS 未包含目标 IPv6 地址。'}";
             }
 
@@ -2418,8 +2983,111 @@ namespace YuanxinGateway
             return string.Equals(RunPowerShell(command).Trim(), "true", StringComparison.OrdinalIgnoreCase);
         }
 
+        private static bool HasCompetingDefaultRoute(string targetGateway, WifiConfig current, string targetGatewayIpv6)
+        {
+            if (current == null || current.InterfaceIndex <= 0) return false;
+            string command = BuildRouteDriftCommand(current.InterfaceIndex, targetGateway, targetGatewayIpv6);
+            return string.Equals(RunPowerShell(command).Trim(), "true", StringComparison.OrdinalIgnoreCase);
+        }
+
+        private static string BuildRouteDriftCommand(int interfaceIndex, string targetGateway, string targetGatewayIpv6)
+        {
+            return RouteGuardSetup(interfaceIndex, targetGateway, targetGatewayIpv6)
+                + "$active=@(Get-NetRoute -PolicyStore ActiveStore -ErrorAction Stop | Where-Object { $_.InterfaceIndex -eq $idx });"
+                + "$persistent=@(Get-NetRoute -PolicyStore PersistentStore -ErrorAction Stop | Where-Object { $_.InterfaceIndex -eq $idx });"
+                + "$drift=$false;foreach($family in $families){$prefix=$family.Prefix;$targetNorm=Normalize-Address $family.Target;"
+                + "if(-not ($active | Where-Object { $_.DestinationPrefix -eq $prefix -and (Normalize-Address $_.NextHop) -eq $targetNorm })){$drift=$true};"
+                + "if(@($active+$persistent | Where-Object { $_.DestinationPrefix -eq $prefix -and ((Normalize-Address $_.NextHop) -ne $targetNorm -or $_.RouteMetric -ne 0) }).Count -gt 0){$drift=$true};}"
+                + "if($drift){Write-Output 'true'}else{Write-Output 'false'}";
+        }
+
+        public static bool CheckHealth(string targetGateway)
+        {
+            OriginalConfig original = LoadOriginal();
+            WifiConfig current = RequireManagedNetwork(original, targetGateway);
+            IPAddress source = IPAddress.Parse(current.IPv4Address);
+            bool reachable = ProbeDns(source, targetGateway) ||
+                ProbeTcp(source, "1.1.1.1", 443) || ProbeTcp(source, "8.8.8.8", 443);
+            EnsureNetworkUnchanged(current);
+            if (HasCompetingDefaultRoute(original.TargetGateway, current, original.TargetGatewayIpv6))
+                throw new InvalidOperationException("检查期间默认路由变化，本轮健康检查已忽略。");
+            return reachable;
+        }
+
+        private static bool ProbeDns(IPAddress source, string targetGateway)
+        {
+            byte[] identifier = Guid.NewGuid().ToByteArray();
+            List<byte> request = new List<byte> { identifier[0], identifier[1], 1, 0, 0, 1, 0, 0, 0, 0, 0, 0 };
+            string name = Guid.NewGuid().ToString("N") + ".example.com";
+            foreach (string label in name.Split('.'))
+            {
+                request.Add((byte)label.Length);
+                request.AddRange(Encoding.ASCII.GetBytes(label));
+            }
+            request.AddRange(new byte[] { 0, 0, 1, 0, 1 });
+            byte[] query = request.ToArray();
+            try
+            {
+                using (UdpClient client = new UdpClient(new IPEndPoint(source, 0)))
+                {
+                    client.Client.ReceiveTimeout = 1500;
+                    client.Client.SendTimeout = 1500;
+                    client.Connect(IPAddress.Parse(targetGateway), 53);
+                    client.Send(query, query.Length);
+                    IPEndPoint remote = null;
+                    byte[] reply = client.Receive(ref remote);
+                    return IsHealthyDnsReply(query, reply);
+                }
+            }
+            catch (SocketException) { return false; }
+        }
+
+        private static bool IsHealthyDnsReply(byte[] query, byte[] reply)
+        {
+            if (reply == null || reply.Length < query.Length || reply[0] != query[0] || reply[1] != query[1] ||
+                (reply[2] & 0xFA) != 0x80 || reply[4] != 0 || reply[5] != 1) return false;
+            for (int position = 12; position < query.Length; position++)
+                if (reply[position] != query[position]) return false;
+            int responseCode = reply[3] & 15;
+            return responseCode == 3 || (responseCode == 0 && (reply[6] != 0 || reply[7] != 0));
+        }
+
+        private static bool ProbeTcp(IPAddress source, string host, int port)
+        {
+            try
+            {
+                using (TcpClient client = new TcpClient(new IPEndPoint(source, 0)))
+                {
+                    IAsyncResult result = client.BeginConnect(IPAddress.Parse(host), port, null, null);
+                    using (WaitHandle handle = result.AsyncWaitHandle)
+                    {
+                        if (!handle.WaitOne(1500)) return false;
+                    }
+                    client.EndConnect(result);
+                    return client.Connected;
+                }
+            }
+            catch (SocketException) { return false; }
+        }
+
+        private static string QuoteWindowsCommandLineArgument(string value)
+        {
+            StringBuilder argument = new StringBuilder("\"");
+            int backslashes = 0;
+            foreach (char character in value ?? string.Empty)
+            {
+                if (character == '\\') { backslashes++; continue; }
+                argument.Append('\\', character == '"' ? backslashes * 2 + 1 : backslashes);
+                argument.Append(character);
+                backslashes = 0;
+            }
+            argument.Append('\\', backslashes * 2);
+            return argument.Append('"').ToString();
+        }
+
         private static string RunPowerShell(string command)
         {
+            command = "$ProgressPreference='SilentlyContinue';" + command;
             string encoded = Convert.ToBase64String(Encoding.Unicode.GetBytes(command));
             return RunCommand("powershell.exe", "-NoProfile -NonInteractive -ExecutionPolicy Bypass -EncodedCommand " + encoded, 20000);
         }
@@ -2455,10 +3123,41 @@ namespace YuanxinGateway
                 string error = errorTask.Result;
                 if (process.ExitCode != 0)
                 {
-                    throw new InvalidOperationException(string.IsNullOrWhiteSpace(error) ? output : error);
+                    throw new InvalidOperationException(CleanCommandError(error, output));
                 }
                 return output;
             }
+        }
+
+        private static string CleanCommandError(string error, string output)
+        {
+            string text = string.IsNullOrWhiteSpace(error) ? output : error;
+            if (string.IsNullOrWhiteSpace(text))
+            {
+                return "命令执行失败。";
+            }
+
+            int xmlStart = text.IndexOf("<Objs", StringComparison.Ordinal);
+            if (xmlStart >= 0)
+            {
+                try
+                {
+                    XmlDocument document = new XmlDocument { XmlResolver = null };
+                    document.LoadXml(text.Substring(xmlStart));
+                    XmlNodeList errors = document.SelectNodes("//*[local-name()='S' and @S='Error']");
+                    StringBuilder message = new StringBuilder();
+                    foreach (XmlNode node in errors) message.Append(node.InnerText);
+                    if (message.Length == 0) return "PowerShell 命令执行失败，未返回可读错误信息。";
+                    text = message.ToString();
+                }
+                catch (XmlException)
+                {
+                    return "PowerShell 命令执行失败，错误信息格式不完整。";
+                }
+            }
+
+            text = text.Replace("_x000D_", "\r").Replace("_x000A_", "\n").Trim();
+            return string.IsNullOrWhiteSpace(text) ? "命令执行失败。" : text;
         }
 
         private static void StopProcessTree(Process process, CommandJob job)
@@ -2484,6 +3183,7 @@ namespace YuanxinGateway
 
         private sealed class OriginalConfig
         {
+            public bool ExcludeTargetRoutes;
             public int BackupVersion;
             public string RoutesJson;
             public string TargetGateway;
