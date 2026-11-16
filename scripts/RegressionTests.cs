@@ -30,7 +30,11 @@ namespace YuanxinGateway
                         RestoreScriptsRemoveBothStores(true);
                         RestoreDoesNotReintroduceTargetFromCleanBackup();
                         RestorePreservesPersistentRouteStore();
+                        RestoreRebindsIpv6ScopeToCurrentInterface();
                         RestoreDeletionFailureIsReported();
+                        RestoreDnsBeforeRouteFailure();
+                        DnsWriteUsesPipelineObject();
+                        NormalizeBackupRemovesTargetDns();
                         UnsafeBackupIsRejected();
                         RouteGuardHandlesDhcp();
                         RouteGuardPreservesFallbackOnFailure();
@@ -190,7 +194,7 @@ namespace YuanxinGateway
                 json += ",{\"PolicyStore\":\"PersistentStore\",\"DestinationPrefix\":\"0.0.0.0/0\",\"NextHop\":\"192.168.3.187\",\"RouteMetric\":1},"
                     + "{\"PolicyStore\":\"ActiveStore\",\"DestinationPrefix\":\"0.0.0.0/0\",\"NextHop\":\"192.168.3.187\",\"RouteMetric\":1}";
             type.GetField("RoutesJson").SetValue(original, json + "]");
-            ManagerCall("RepairTargetBackup", original);
+            ManagerCall("NormalizeBackup", original);
             return original;
         }
 
@@ -222,7 +226,14 @@ function Set-NetRoute {
  [CmdletBinding(SupportsShouldProcess=$true)]param([Parameter(ValueFromPipeline=$true)]$InputObject,$RouteMetric)
  process {$InputObject.RouteMetric=$RouteMetric}
 }
-function netsh {$script:dnsCalls+=($args -join ' ');$global:LASTEXITCODE=0}
+function Set-DnsClientServerAddress {
+ [CmdletBinding(SupportsShouldProcess=$true)]param([Parameter(ValueFromPipeline=$true)]$InputObject,$ServerAddresses,[switch]$ResetServerAddresses)
+ process {$script:dnsCalls+=($InputObject.AddressFamilyName + ':' + $(if($ResetServerAddresses){'dhcp'}else{$ServerAddresses -join ','}))}
+}
+function Get-DnsClientServerAddress {
+ [CmdletBinding()]param($InterfaceIndex,$AddressFamily)
+ [pscustomobject]@{InterfaceIndex=$InterfaceIndex;AddressFamilyName=$AddressFamily;AddressFamily=if($AddressFamily -eq 'IPv4'){2}else{23};ServerAddresses=@()}
+}
 function Clear-DnsClientCache {[CmdletBinding()]param()}
 function Register-DnsClient {[CmdletBinding()]param()}
 ";
@@ -253,7 +264,7 @@ if(-not ($script:mockRoutes | Where-Object {$_.InterfaceIndex -eq 12 -and $_.Nex
 if(-not ($script:mockRoutes | Where-Object {$_.InterfaceIndex -eq 12 -and (Normalize-Address $_.NextHop) -eq 'fe80::1' -and $_.RouteMetric -eq 16})){throw 'original IPv6 gateway not restored'}
 if(-not ($script:mockRoutes | Where-Object {$_.InterfaceIndex -eq 88})){throw 'unrelated interface changed'}
 if($script:deletes[0] -ne 'PersistentStore:192.168.3.187'){throw 'persistent route not removed first'}
-if(@($script:dnsCalls | Where-Object {$_ -like '*source=dhcp*'}).Count -ne 2){throw 'DHCP DNS not restored for both families'}
+if(@($script:dnsCalls | Where-Object {$_ -like '*:dhcp'}).Count -ne 2){throw 'DHCP DNS not restored for both families'}
 ";
             ManagerCall("RunPowerShell", NetworkStubs + restore + assertions + verify);
             Console.WriteLine("PASS: actual restore script, both stores/families, original metric, unrelated adapter; contaminated=" + contaminated);
@@ -273,6 +284,46 @@ if(@($script:dnsCalls | Where-Object {$_ -like '*source=dhcp*'}).Count -ne 2){th
                     "Deletion failure was not readable: " + ex.Message);
             }
             Console.WriteLine("PASS: actual PowerShell deletion errors are not swallowed or shown as XML");
+        }
+
+        private static void RestoreDnsBeforeRouteFailure()
+        {
+            object original = Original(false);
+            string restore = (string)ManagerCall("BuildRestoreCommand", original, 12, true);
+            ManagerCall("RunPowerShell", NetworkStubs + "$script:denyDelete=$true;$failed=$false;try{" + restore
+                + "}catch{$failed=$true};"
+                + "if(-not $failed){throw 'route failure was not reported'};"
+                + "if(@($script:dnsCalls | Where-Object {$_ -like '*:dhcp'}).Count -ne 2){throw 'DNS was not restored before route failure'};");
+            Console.WriteLine("PASS: DNS restored even when route removal fails");
+        }
+
+        private static void NormalizeBackupRemovesTargetDns()
+        {
+            object original = Original(true);
+            Type type = original.GetType();
+            type.GetField("BackupVersion").SetValue(original, 2);
+            List<string> dns = new List<string> { "192.168.3.187", "fe80::187", "192.168.3.1" };
+            type.GetField("DnsServers").SetValue(original, dns);
+            type.GetField("IsDnsDhcp").SetValue(original, false);
+            type.GetField("IsIpv6DnsDhcp").SetValue(original, false);
+            ManagerCall("NormalizeBackup", original);
+            Assert(dns.Count == 1 && dns[0] == "192.168.3.1", "Bypass DNS remained in a version 2 backup.");
+            Assert(!(bool)type.GetField("IsDnsDhcp").GetValue(original), "Original static IPv4 DNS was changed to DHCP.");
+            Assert((bool)type.GetField("IsIpv6DnsDhcp").GetValue(original), "Empty IPv6 DNS was not reset to DHCP.");
+            Console.WriteLine("PASS: backup normalization removes bypass DNS consistently across backup versions");
+        }
+
+        private static void DnsWriteUsesPipelineObject()
+        {
+            object original = Original(false);
+            string restore = (string)ManagerCall("BuildRestoreCommand", original, 12, true);
+            Assert(restore.Contains("Get-DnsClientServerAddress -InterfaceIndex $idx -AddressFamily 'IPv4' -ErrorAction Stop | Set-DnsClientServerAddress"),
+                "IPv4 DNS write did not target the IPv4 CIM object.");
+            Assert(!restore.Contains("Set-DnsClientServerAddress -InterfaceIndex $idx -AddressFamily"),
+                "DNS write used a nonexistent AddressFamily parameter.");
+            Assert(restore.Contains("-AddressFamily 'IPv6' -ErrorAction Stop | Set-DnsClientServerAddress"),
+                "IPv6 DNS write did not target the IPv6 CIM object.");
+            Console.WriteLine("PASS: DNS writes use supported pipeline objects and preserve address-family isolation");
         }
 
         private static void RestoreDoesNotReintroduceTargetFromCleanBackup()
@@ -299,6 +350,22 @@ if(@($script:dnsCalls | Where-Object {$_ -like '*source=dhcp*'}).Count -ne 2){th
                 + "$persistent=$script:mockRoutes | Where-Object {$_.InterfaceIndex -eq 12 -and $_.PolicyStore -eq 'PersistentStore' -and $_.NextHop -eq '192.168.3.1'};"
                 + "if(-not $persistent -or $persistent.RouteMetric -ne 7){throw 'persistent original route was not restored to PersistentStore'};");
             Console.WriteLine("PASS: restore preserves PersistentStore routes and metrics");
+        }
+
+        private static void RestoreRebindsIpv6ScopeToCurrentInterface()
+        {
+            object original = Original(false);
+            original.GetType().GetField("RoutesJson").SetValue(original,
+                "[{\"PolicyStore\":\"ActiveStore\",\"DestinationPrefix\":\"::/0\",\"NextHop\":\"fe80::1%10\",\"RouteMetric\":16}]");
+            string restore = (string)ManagerCall("BuildRestoreCommand", original, 12, true);
+            string script = NetworkStubs
+                + "function New-NetRoute { [CmdletBinding()]param($PolicyStore='ActiveStore',$InterfaceIndex,$DestinationPrefix,$NextHop,$RouteMetric);"
+                + "if($NextHop -like 'fe80:*%*'){throw 'scoped link-local next hop rejected'};"
+                + "$script:mockRoutes += [pscustomobject]@{PolicyStore=$PolicyStore;InterfaceIndex=$InterfaceIndex;DestinationPrefix=$DestinationPrefix;NextHop=$NextHop;RouteMetric=$RouteMetric} }"
+                + restore
+                + "if(-not ($script:mockRoutes | Where-Object {$_.InterfaceIndex -eq 12 -and $_.DestinationPrefix -eq '::/0' -and $_.NextHop -eq 'fe80::1' -and $_.RouteMetric -eq 16})){throw 'IPv6 route did not restore with unscoped next hop'};";
+            ManagerCall("RunPowerShell", script);
+            Console.WriteLine("PASS: IPv6 link-local restore discards stale scope and uses current interface");
         }
 
         private static void UnsafeBackupIsRejected()
@@ -332,7 +399,7 @@ if(@($script:dnsCalls | Where-Object {$_ -like '*source=dhcp*'}).Count -ne 2){th
             ManagerCall("RunPowerShell", NetworkStubs + restore + verify
                 + "if($script:mockRoutes | Where-Object {$_.InterfaceIndex -eq 12}){throw 'old routes copied to disconnected/new network'};"
                 + "if(-not ($script:mockRoutes | Where-Object {$_.InterfaceIndex -eq 88})){throw 'wired adapter changed'};"
-                + "if(@($script:dnsCalls | Where-Object {$_ -like '*source=dhcp*'}).Count -ne 2){throw 'DNS not reset'};");
+                + "if(@($script:dnsCalls | Where-Object {$_ -like '*:dhcp'}).Count -ne 2){throw 'DNS not reset'};");
             Console.WriteLine("PASS: disconnected/changed network cleanup only removes owned routes on saved interface");
         }
 
@@ -365,7 +432,7 @@ if(@($script:dnsCalls | Where-Object {$_ -like '*source=dhcp*'}).Count -ne 2){th
             string restore = (string)ManagerCall("BuildRestoreCommand", original, 12, false);
             ManagerCall("RunPowerShell", NetworkStubs + restore
                 + "if(-not ($script:mockRoutes | Where-Object {$_.InterfaceIndex -eq 12 -and $_.DestinationPrefix -eq '::/0'})){throw 'IPv4 restore removed unrelated IPv6 route'};"
-                + "if($script:dnsCalls | Where-Object {$_ -like '*ipv6*'}){throw 'IPv4 restore changed IPv6 DNS'};");
+                + "if($script:dnsCalls | Where-Object {$_ -like '*IPv6*'}){throw 'IPv4 restore changed IPv6 DNS'};");
             Console.WriteLine("PASS: restoring IPv4 backup does not adopt later IPv6 settings");
         }
 

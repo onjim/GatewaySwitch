@@ -2368,11 +2368,12 @@ namespace YuanxinGateway
                     + "$gw6Scoped=Add-ScopeIfNeeded $gw6 $idx;"
                     + "$gw6Norm=Normalize-Address $gw6;"
                     + "try{New-NetRoute -InterfaceIndex $idx -DestinationPrefix '::/0' -NextHop $gw6 -RouteMetric 0 -ErrorAction Stop;}catch{New-NetRoute -InterfaceIndex $idx -DestinationPrefix '::/0' -NextHop $gw6Scoped -RouteMetric 0 -ErrorAction Stop;}"
-                    + "Set-StaticDns $idx @($gw) @($gw6);";
+                    + "Set-DnsFamily 'ipv4' $idx @($gw);"
+                    + "Set-DnsFamily 'ipv6' $idx @($gw6);";
             }
             else
             {
-                command += "Set-NetshDnsFamily 'ipv4' $idx @($gw);";
+                command += "Set-DnsFamily 'ipv4' $idx @($gw);";
             }
 
             command += "Clear-DnsClientCache -ErrorAction SilentlyContinue;"
@@ -2459,6 +2460,10 @@ namespace YuanxinGateway
             string targetGateway = !string.IsNullOrEmpty(original.TargetGateway) ? original.TargetGateway : GetConfigGatewayIp();
             string targetGatewayIpv6 = original.TargetGatewayIpv6 ?? string.Empty;
             bool restoreIpv6 = !string.IsNullOrEmpty(targetGatewayIpv6);
+            List<string> cleanDns4 = original.DnsServers.FindAll(d => !d.Contains(":"));
+            List<string> cleanDns6 = original.DnsServers.FindAll(d => d.Contains(":"));
+            bool useDhcpV4 = original.IsDnsDhcp || cleanDns4.Count == 0;
+            bool useDhcpV6 = original.IsIpv6DnsDhcp || cleanDns6.Count == 0;
 
             string command = "$ErrorActionPreference='Stop';$idx=" + index + ";"
                 + "$target='" + EscapePowerShell(targetGateway) + "';"
@@ -2466,6 +2471,12 @@ namespace YuanxinGateway
                 + PowerShellDnsFunction()
                 + (original.ExcludeTargetRoutes ? SavedRoutesCommand(original)
                     + "if(-not ($savedRoutes | Where-Object { $_.DestinationPrefix -eq '0.0.0.0/0' })){throw '备份只有旁路由网关，无法确定原网关；已停止恢复并保留备份。'};" : "")
+                + "$dns4=@(" + QuotePowerShellArray(cleanDns4) + ");"
+                + "$dns6=@(" + QuotePowerShellArray(cleanDns6) + ");"
+                + (useDhcpV4 ? "Get-DnsClientServerAddress -InterfaceIndex $idx -AddressFamily 'IPv4' -ErrorAction Stop | Set-DnsClientServerAddress -ResetServerAddresses -Confirm:$false;"
+                    : "Get-DnsClientServerAddress -InterfaceIndex $idx -AddressFamily 'IPv4' -ErrorAction Stop | Set-DnsClientServerAddress -ServerAddresses $dns4 -Confirm:$false;")
+                + (restoreIpv6 ? (useDhcpV6 ? "Get-DnsClientServerAddress -InterfaceIndex $idx -AddressFamily 'IPv6' -ErrorAction Stop | Set-DnsClientServerAddress -ResetServerAddresses -Confirm:$false;"
+                    : "Get-DnsClientServerAddress -InterfaceIndex $idx -AddressFamily 'IPv6' -ErrorAction Stop | Set-DnsClientServerAddress -ServerAddresses $dns6 -Confirm:$false;") : "")
                 + "function Remove-TargetRoutes($prefix,$targetNorm){"
                 + "for($attempt=0;$attempt -lt 3;$attempt++){"
                 + "$found=$false;"
@@ -2494,20 +2505,6 @@ namespace YuanxinGateway
             if (sameNetwork)
             {
                 command += RestoreRoutesCommand(original);
-            }
-
-            List<string> cleanDns4 = original.DnsServers.FindAll(d => !d.Contains(":"));
-            List<string> cleanDns6 = original.DnsServers.FindAll(d => d.Contains(":"));
-
-            bool useDhcpV4 = original.IsDnsDhcp || cleanDns4.Count == 0;
-            bool useDhcpV6 = original.IsIpv6DnsDhcp || cleanDns6.Count == 0;
-
-            command += "$dns4=@(" + QuotePowerShellArray(cleanDns4) + ");"
-                + "$dns6=@(" + QuotePowerShellArray(cleanDns6) + ");"
-                + (useDhcpV4 ? "Reset-DnsFamily 'ipv4' $idx;" : "Set-NetshDnsFamily 'ipv4' $idx $dns4;");
-            if (restoreIpv6)
-            {
-                command += (useDhcpV6 ? "Reset-DnsFamily 'ipv6' $idx;" : "Set-NetshDnsFamily 'ipv6' $idx $dns6;");
             }
 
             // DHCP can recreate a default route while the interface is being reset.
@@ -2635,41 +2632,21 @@ namespace YuanxinGateway
                     {
                         config.Ssid = GetConfigSsid();
                     }
-
-                    string normTarget4 = NormalizeAddressText(config.TargetGateway);
-                    string normTarget6 = NormalizeAddressText(config.TargetGatewayIpv6);
-
-                    bool hasNonTargetDns4 = config.DnsServers.Exists(d => !d.Contains(":") && d != normTarget4);
-                    bool hasNonTargetDns6 = config.DnsServers.Exists(d => d.Contains(":") && d != normTarget6);
-
-                    if (!hasNonTargetDns4)
-                    {
-                        config.IsDnsDhcp = true;
-                    }
-                    if (!hasNonTargetDns6)
-                    {
-                        config.IsIpv6DnsDhcp = true;
-                    }
-
-                    config.DnsServers.RemoveAll(d => d == normTarget4 || d == normTarget6);
                 }
             }
-            RepairTargetBackup(config);
+            NormalizeBackup(config);
             return config;
         }
 
-        private static void RepairTargetBackup(OriginalConfig config)
+        private static void NormalizeBackup(OriginalConfig config)
         {
             config.ExcludeTargetRoutes = !string.IsNullOrEmpty(config.TargetGateway) &&
                 AddressesEqual(config.Gateway, config.TargetGateway);
-            if (!config.ExcludeTargetRoutes) return;
 
-            // An interrupted/older enable can capture its own target as the original.
-            // Keep the stored backup intact; use only non-target settings for recovery.
             string target4 = NormalizeAddressText(config.TargetGateway);
             string target6 = NormalizeAddressText(config.TargetGatewayIpv6);
-            config.DnsServers.RemoveAll(d => NormalizeAddressText(d) == target4 ||
-                (!string.IsNullOrEmpty(target6) && NormalizeAddressText(d) == target6));
+            // Older backups may have captured the bypass gateway as their own DNS.
+            config.DnsServers.RemoveAll(d => AddressesEqual(d, target4) || AddressesEqual(d, target6));
             if (!config.DnsServers.Exists(d => !d.Contains(":"))) config.IsDnsDhcp = true;
             if (!config.DnsServers.Exists(d => d.Contains(":"))) config.IsIpv6DnsDhcp = true;
         }
@@ -2732,9 +2709,10 @@ namespace YuanxinGateway
             if (!string.IsNullOrEmpty(original.RoutesJson))
             {
                 return SavedRoutesCommand(original)
-                    + "foreach($saved in $savedRoutes){$next=Add-ScopeIfNeeded $saved.NextHop $idx;"
+                    + "foreach($saved in $savedRoutes){$next=Normalize-Address $saved.NextHop;"
                     + "$existing=@(Get-NetRoute -PolicyStore $saved.PolicyStore -ErrorAction SilentlyContinue | Where-Object { $_.InterfaceIndex -eq $idx -and $_.DestinationPrefix -eq $saved.DestinationPrefix -and (Normalize-Address $_.NextHop) -eq (Normalize-Address $saved.NextHop) });"
-                    + "if($existing.Count -eq 0){$options=@{InterfaceIndex=$idx;DestinationPrefix=$saved.DestinationPrefix;NextHop=$next;RouteMetric=$saved.RouteMetric;ErrorAction='Stop'};if($saved.PolicyStore -eq 'ActiveStore' -or $saved.PolicyStore -eq 'PersistentStore'){$options.PolicyStore=$saved.PolicyStore};New-NetRoute @options | Out-Null;}"
+                    + "if($existing.Count -eq 0){$options=@{InterfaceIndex=$idx;DestinationPrefix=$saved.DestinationPrefix;NextHop=$next;RouteMetric=$saved.RouteMetric;ErrorAction='Stop'};if($saved.PolicyStore -eq 'ActiveStore' -or $saved.PolicyStore -eq 'PersistentStore'){$options.PolicyStore=$saved.PolicyStore};"
+                    + "try{New-NetRoute @options | Out-Null;}catch{if($next -notlike 'fe80:*'){throw};$options.NextHop=$next + '%' + $idx;New-NetRoute @options | Out-Null;}}"
                     + "else{$existing | Where-Object { $_.RouteMetric -ne $saved.RouteMetric } | Set-NetRoute -RouteMetric $saved.RouteMetric -Confirm:$false -ErrorAction Stop | Out-Null;}}";
             }
 
@@ -2922,20 +2900,13 @@ namespace YuanxinGateway
 
         private static string PowerShellDnsFunction()
         {
-            return "function Set-NetshDnsFamily($family,$idx,[string[]]$addresses){"
+            return "function Set-DnsFamily($family,$idx,[string[]]$addresses){"
                 + "$clean=@();if($null -ne $addresses){$clean=@($addresses | ForEach-Object { Normalize-Address $_ } | Where-Object { -not [string]::IsNullOrWhiteSpace($_) });}"
-                + "if($clean.Count -eq 0){& netsh interface $family set dnsservers \"name=$idx\" source=static address=none validate=no | Out-Null;if($LASTEXITCODE -ne 0){throw ($family + ' DNS 清除失败');}return;}"
-                + "$first=$clean[0];"
-                + "& netsh interface $family set dnsservers \"name=$idx\" source=static \"address=$first\" register=primary validate=no | Out-Null;"
-                + "if($LASTEXITCODE -ne 0){throw ($family + ' DNS 写入失败: ' + $first);}"
-                + "for($i=1;$i -lt $clean.Count;$i++){"
-                + "$address=$clean[$i];$order=$i + 1;"
-                + "& netsh interface $family add dnsservers \"name=$idx\" \"address=$address\" \"index=$order\" validate=no | Out-Null;"
-                + "if($LASTEXITCODE -ne 0){throw ($family + ' DNS 追加失败: ' + $address);}"
-                + "}"
-                + "};"
-                + "function Set-StaticDns($idx,[string[]]$v4,[string[]]$v6){Set-NetshDnsFamily 'ipv4' $idx $v4;Set-NetshDnsFamily 'ipv6' $idx $v6;};"
-                + "function Reset-DnsFamily($family,$idx){& netsh interface $family set dnsservers \"name=$idx\" source=dhcp | Out-Null;if($LASTEXITCODE -ne 0){throw ($family + ' DHCP DNS 恢复失败');}};";
+                + "$familyName=if($family -eq 'ipv4'){'IPv4'}else{'IPv6'};"
+                + "$target=@(Get-DnsClientServerAddress -InterfaceIndex $idx -AddressFamily $familyName -ErrorAction Stop);"
+                + "if($target.Count -eq 0){throw ($familyName + ' DNS 配置不可用');}"
+                + "if($clean.Count -eq 0){$target | Set-DnsClientServerAddress -ResetServerAddresses -Confirm:$false -ErrorAction Stop;return;}"
+                + "$target | Set-DnsClientServerAddress -ServerAddresses $clean -Confirm:$false -ErrorAction Stop;};";
         }
 
         private static void VerifyApplied(int interfaceIndex, string targetGateway, string targetGatewayIpv6)
