@@ -1746,7 +1746,6 @@ namespace YuanxinGateway
         private const string RegistryPath = "Software\\YuanxinGatewaySwitch";
         private const string DefaultGatewayIp = "192.168.3.187";
         private const string DefaultGatewayIpv6 = "fe80::20c:29ff:fe2b:cd7d";
-
         public static bool TryNormalizeGatewayIpv6Input(string value, out string normalized, out string error)
         {
             normalized = string.Empty;
@@ -2226,10 +2225,74 @@ namespace YuanxinGateway
         {
             OriginalConfig original = LoadOriginal();
             WifiConfig current = RequireManagedNetwork(original, targetGateway);
-            EnsureNetworkUnchanged(current);
-            RunPowerShell(BuildRepairTargetCommand(current.InterfaceIndex, original.TargetGateway, original.TargetGatewayIpv6));
-            VerifyApplied(current.InterfaceIndex, original.TargetGateway, original.TargetGatewayIpv6);
-            EnsureNetworkUnchanged(current);
+            RunStableRouteRepair(
+                () =>
+                {
+                    RequireManagedNetwork(original, targetGateway);
+                    EnsureNetworkUnchanged(current);
+                },
+                () => RunPowerShell(BuildRepairTargetCommand(current.InterfaceIndex, original.TargetGateway, original.TargetGatewayIpv6)),
+                () => !HasCompetingDefaultRoute(original.TargetGateway, current, original.TargetGatewayIpv6),
+                () => VerifyApplied(current.InterfaceIndex, original.TargetGateway, original.TargetGatewayIpv6),
+                phase => LogRouteSnapshot(current.InterfaceIndex, phase),
+                () => Thread.Sleep(400));
+        }
+
+        internal static void RunStableRouteRepair(Action ensureNetwork, Action repair, Func<bool> routesStable,
+            Action verify, Action<string> record, Action wait)
+        {
+            // Retry only observed route drift. Permission, DNS and identity errors must fail immediately.
+            Stopwatch timer = Stopwatch.StartNew();
+            for (int attempt = 1; attempt <= 3; attempt++)
+            {
+                if (attempt > 1 && timer.Elapsed.TotalSeconds >= 15) break;
+                ensureNetwork();
+                record("before repair " + attempt);
+                repair();
+                bool stable = true;
+                for (int observation = 0; observation < 3; observation++)
+                {
+                    wait();
+                    ensureNetwork();
+                    if (!routesStable())
+                    {
+                        stable = false;
+                        break;
+                    }
+                }
+                record("after repair " + attempt);
+                if (!stable) continue;
+                try
+                {
+                    verify();
+                }
+                catch (Exception ex)
+                {
+                    DiagnosticLog.Write("Route verification failed: " + ex);
+                    ensureNetwork();
+                    if (routesStable()) throw;
+                    continue;
+                }
+                ensureNetwork();
+                return;
+            }
+            throw new InvalidOperationException("默认路由冲突持续存在，原始备份已保留。");
+        }
+
+        private static void LogRouteSnapshot(int interfaceIndex, string phase)
+        {
+            try
+            {
+                string command = "$ErrorActionPreference='Stop';foreach($store in @('ActiveStore','PersistentStore')){"
+                    + "Get-NetRoute -PolicyStore $store -InterfaceIndex " + interfaceIndex
+                    + " -ErrorAction Stop | Where-Object {$_.DestinationPrefix -in @('0.0.0.0/0','::/0')} | "
+                    + "Select-Object @{Name='Store';Expression={$store}},InterfaceIndex,DestinationPrefix,NextHop,Protocol,RouteMetric,ValidLifetime | ConvertTo-Csv -NoTypeInformation;}";
+                DiagnosticLog.Write(phase + Environment.NewLine + RunPowerShell(command));
+            }
+            catch (Exception ex)
+            {
+                DiagnosticLog.Write(phase + " snapshot unavailable: " + ex.Message);
+            }
         }
 
         private static WifiConfig GetOriginalNetwork(OriginalConfig original, string ssid, string wifiInterfaceId)

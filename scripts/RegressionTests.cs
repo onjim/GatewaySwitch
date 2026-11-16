@@ -35,6 +35,8 @@ namespace YuanxinGateway
                         RestoreDnsBeforeRouteFailure();
                         DnsWriteUsesPipelineObject();
                         NormalizeBackupRemovesTargetDns();
+                        RouteRepairWaitsForStability();
+                        RouteRepairStopsSafely();
                         UnsafeBackupIsRejected();
                         RouteGuardHandlesDhcp();
                         RouteGuardPreservesFallbackOnFailure();
@@ -324,6 +326,75 @@ if(@($script:dnsCalls | Where-Object {$_ -like '*:dhcp'}).Count -ne 2){throw 'DH
             Assert(restore.Contains("-AddressFamily 'IPv6' -ErrorAction Stop | Set-DnsClientServerAddress"),
                 "IPv6 DNS write did not target the IPv6 CIM object.");
             Console.WriteLine("PASS: DNS writes use supported pipeline objects and preserve address-family isolation");
+        }
+
+        private static void RouteRepairWaitsForStability()
+        {
+            int repairs = 0, observations = 0, verified = 0, recorded = 0, waits = 0;
+            GatewayManager.RunStableRouteRepair(() => { }, () => repairs++,
+                () => ++observations > 1, () => verified++, phase => recorded++, () => waits++);
+            Assert(repairs == 2 && observations == 4 && verified == 1 && recorded == 4 && waits == 4,
+                "Transient reinjection did not retry and require three stable observations.");
+
+            repairs = 0;
+            bool failed = false;
+            try
+            {
+                GatewayManager.RunStableRouteRepair(() => { }, () => repairs++, () => false,
+                    () => { throw new Exception("Must not verify unstable routes"); }, phase => { }, () => { });
+            }
+            catch (InvalidOperationException) { failed = true; }
+            Assert(failed && repairs == 3, "Persistent drift was not limited to three repairs.");
+
+            repairs = 0;
+            verified = 0;
+            bool lateConflict = false;
+            GatewayManager.RunStableRouteRepair(() => { }, () => { repairs++; lateConflict = false; },
+                () => !lateConflict,
+                () =>
+                {
+                    if (++verified == 1)
+                    {
+                        lateConflict = true;
+                        throw new InvalidOperationException("IPv6 default route reinjected during verification");
+                    }
+                }, phase => { }, () => { });
+            Assert(repairs == 2 && verified == 2, "Late reinjection was not retried.");
+            Console.WriteLine("PASS: transient/late route reinjection waits for stability, persistent drift is bounded");
+        }
+
+        private static void RouteRepairStopsSafely()
+        {
+            int repairs = 0, checks = 0;
+            bool failed = false;
+            try
+            {
+                GatewayManager.RunStableRouteRepair(
+                    () => { if (++checks == 2) throw new InvalidOperationException("network changed"); },
+                    () => repairs++, () => true, () => { }, phase => { }, () => { });
+            }
+            catch (InvalidOperationException) { failed = true; }
+            Assert(failed && repairs == 1, "Network identity change did not stop retries.");
+            failed = false;
+            repairs = 0;
+            try
+            {
+                GatewayManager.RunStableRouteRepair(() => { },
+                    () => { repairs++; throw new UnauthorizedAccessException("denied"); },
+                    () => true, () => { }, phase => { }, () => { });
+            }
+            catch (UnauthorizedAccessException) { failed = true; }
+            Assert(failed && repairs == 1, "Permission errors were retried.");
+            failed = false;
+            repairs = 0;
+            try
+            {
+                GatewayManager.RunStableRouteRepair(() => { }, () => repairs++, () => true,
+                    () => { throw new InvalidOperationException("DNS mismatch"); }, phase => { }, () => { });
+            }
+            catch (InvalidOperationException) { failed = true; }
+            Assert(failed && repairs == 1, "Non-route verification errors were retried.");
+            Console.WriteLine("PASS: network changes, permissions and DNS errors abort route retries");
         }
 
         private static void RestoreDoesNotReintroduceTargetFromCleanBackup()
