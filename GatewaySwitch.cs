@@ -1744,7 +1744,7 @@ namespace YuanxinGateway
     internal static class GatewayManager
     {
         private const string RegistryPath = "Software\\YuanxinGatewaySwitch";
-        private const string DefaultGatewayIp = "192.168.3.187";
+        private const string DefaultGatewayIp = "192.168.30.153";
         private const string DefaultGatewayIpv6 = "fe80::20c:29ff:fe2b:cd7d";
         public static bool TryNormalizeGatewayIpv6Input(string value, out string normalized, out string error)
         {
