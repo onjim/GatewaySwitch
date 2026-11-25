@@ -3,15 +3,17 @@ using System.Collections.Generic;
 using System.Diagnostics;
 using System.Drawing;
 using System.Drawing.Drawing2D;
+using System.IO;
 using System.Net;
 using System.Net.NetworkInformation;
 using System.Net.Sockets;
 using System.Runtime.InteropServices;
+using System.Runtime.Serialization;
+using System.Runtime.Serialization.Json;
 using System.Text;
 using System.Threading;
 using System.Threading.Tasks;
 using System.Windows.Forms;
-using System.Xml;
 using Microsoft.Win32;
 
 namespace YuanxinGateway
@@ -1294,6 +1296,7 @@ namespace YuanxinGateway
         public bool IsDnsDhcp;
         public bool IsIpv6DnsDhcp;
         public bool IsWifi;
+        public bool SupportsIpv6;
         public string Ssid;
         public bool IsConnected;
     }
@@ -1876,6 +1879,27 @@ namespace YuanxinGateway
             return "";
         }
 
+        private static readonly string[] VirtualAdapterKeywords =
+        {
+            "virtual", "pseudo", "loopback", "hyper-v", "wsl", "vmware",
+            "virtualbox", "vpn", "wintun", "wireguard", "tap-", "tun ",
+            "tailscale", "clash", "mihomo", "zerotier", "sing-box", "nekoray", "utun"
+        };
+
+        private static bool IsVirtualOrTunnelAdapter(NetworkInterface item)
+        {
+            string description = (item.Description ?? string.Empty).ToLowerInvariant();
+            string name = (item.Name ?? string.Empty).ToLowerInvariant();
+            foreach (string keyword in VirtualAdapterKeywords)
+            {
+                if (description.Contains(keyword) || name.Contains(keyword))
+                {
+                    return true;
+                }
+            }
+            return false;
+        }
+
         public static List<AdapterChoice> GetAdapterChoices()
         {
             List<AdapterChoice> choices = new List<AdapterChoice>();
@@ -1887,11 +1911,7 @@ namespace YuanxinGateway
                     continue;
                 }
 
-                string description = (item.Description ?? string.Empty).ToLowerInvariant();
-                if (description.Contains("virtual") || description.Contains("pseudo") ||
-                    description.Contains("loopback") || description.Contains("hyper-v") ||
-                    description.Contains("wsl") || description.Contains("vmware") ||
-                    description.Contains("virtualbox") || description.Contains("vpn"))
+                if (IsVirtualOrTunnelAdapter(item))
                 {
                     continue;
                 }
@@ -2040,11 +2060,7 @@ namespace YuanxinGateway
                     continue;
                 }
 
-                // Filter virtual adapters
-                string desc = item.Description.ToLower();
-                if (desc.Contains("virtual") || desc.Contains("pseudo") || desc.Contains("loopback") || 
-                    desc.Contains("hyper-v") || desc.Contains("wsl") || desc.Contains("vmware") || 
-                    desc.Contains("virtualbox") || desc.Contains("vpn"))
+                if (IsVirtualOrTunnelAdapter(item))
                 {
                     continue;
                 }
@@ -2089,6 +2105,7 @@ namespace YuanxinGateway
                 config.IsDnsDhcp = true;
                 config.IsIpv6DnsDhcp = true;
                 config.IsWifi = item.NetworkInterfaceType == NetworkInterfaceType.Wireless80211;
+                config.SupportsIpv6 = item.Supports(NetworkInterfaceComponent.IPv6);
                 config.Ssid = config.IsWifi && string.Equals(item.Id.Trim('{', '}'), activeInterfaceId, StringComparison.OrdinalIgnoreCase) ? activeSsid : null;
 
                 using (RegistryKey key = Registry.LocalMachine.OpenSubKey(@"SYSTEM\CurrentControlSet\Services\Tcpip\Parameters\Interfaces\" + item.Id))
@@ -2199,7 +2216,8 @@ namespace YuanxinGateway
                 !observed.IsWifi || !string.IsNullOrEmpty(observed.Ssid));
             bool canMaintain = hasOriginal && known && managed.IsConnected && IsSameNetwork(original, managed);
             string activeTarget = hasOriginal ? original.TargetGateway : targetGateway;
-            string activeTarget6 = hasOriginal ? original.TargetGatewayIpv6 : GetNormalizedConfigGatewayIpv6();
+            string activeTarget6 = hasOriginal ? original.TargetGatewayIpv6 :
+                (observed != null && !observed.SupportsIpv6 ? string.Empty : GetNormalizedConfigGatewayIpv6());
             bool isActive = IsTargetActive(activeTarget, observed, activeTarget6);
             return new NetworkSnapshot
             {
@@ -2225,17 +2243,25 @@ namespace YuanxinGateway
         {
             OriginalConfig original = LoadOriginal();
             WifiConfig current = RequireManagedNetwork(original, targetGateway);
-            RunStableRouteRepair(
-                () =>
-                {
-                    RequireManagedNetwork(original, targetGateway);
-                    EnsureNetworkUnchanged(current);
-                },
-                () => RunPowerShell(BuildRepairTargetCommand(current.InterfaceIndex, original.TargetGateway, original.TargetGatewayIpv6)),
-                () => !HasCompetingDefaultRoute(original.TargetGateway, current, original.TargetGatewayIpv6),
-                () => VerifyApplied(current.InterfaceIndex, original.TargetGateway, original.TargetGatewayIpv6),
-                phase => LogRouteSnapshot(current.InterfaceIndex, phase),
-                () => Thread.Sleep(400));
+            try
+            {
+                RunStableRouteRepair(
+                    () =>
+                    {
+                        RequireManagedNetwork(original, targetGateway);
+                        EnsureNetworkUnchanged(current);
+                    },
+                    () => RepairTargetRoutesNative(current.InterfaceIndex, original.TargetGateway, original.TargetGatewayIpv6),
+                    () => !HasCompetingDefaultRoute(original.TargetGateway, current, original.TargetGatewayIpv6),
+                    () => VerifyApplied(current.InterfaceIndex, original.TargetGateway, original.TargetGatewayIpv6),
+                    phase => LogRouteSnapshot(current.InterfaceIndex, phase),
+                    () => Thread.Sleep(400));
+            }
+            catch (Exception ex)
+            {
+                DiagnosticLog.Write("RepairTarget failed: " + ex);
+                throw;
+            }
         }
 
         internal static void RunStableRouteRepair(Action ensureNetwork, Action repair, Func<bool> routesStable,
@@ -2283,11 +2309,17 @@ namespace YuanxinGateway
         {
             try
             {
-                string command = "$ErrorActionPreference='Stop';foreach($store in @('ActiveStore','PersistentStore')){"
-                    + "Get-NetRoute -PolicyStore $store -InterfaceIndex " + interfaceIndex
-                    + " -ErrorAction Stop | Where-Object {$_.DestinationPrefix -in @('0.0.0.0/0','::/0')} | "
-                    + "Select-Object @{Name='Store';Expression={$store}},InterfaceIndex,DestinationPrefix,NextHop,Protocol,RouteMetric,ValidLifetime | ConvertTo-Csv -NoTypeInformation;}";
-                DiagnosticLog.Write(phase + Environment.NewLine + RunPowerShell(command));
+                List<RouteEntry> routes = NativeNetwork.GetDefaultRoutes(interfaceIndex);
+                StringBuilder sb = new StringBuilder();
+                sb.AppendLine(phase);
+                sb.AppendLine("\"Store\",\"InterfaceIndex\",\"DestinationPrefix\",\"NextHop\",\"Protocol\",\"RouteMetric\"");
+                foreach (RouteEntry r in routes)
+                {
+                    sb.AppendFormat("\"{0}\",\"{1}\",\"{2}\",\"{3}\",\"{4}\",\"{5}\"",
+                        r.PolicyStore, r.InterfaceIndex, r.DestinationPrefix, r.NextHop, r.Protocol, r.Metric);
+                    sb.AppendLine();
+                }
+                DiagnosticLog.Write(sb.ToString().TrimEnd());
             }
             catch (Exception ex)
             {
@@ -2372,6 +2404,11 @@ namespace YuanxinGateway
             }
 
             string targetGatewayIpv6 = GetNormalizedConfigGatewayIpv6(true);
+            if (!string.IsNullOrEmpty(targetGatewayIpv6) && !current.SupportsIpv6)
+            {
+                DiagnosticLog.Write("Adapter " + current.InterfaceAlias + " does not support IPv6; skipping IPv6 bypass gateway.");
+                targetGatewayIpv6 = string.Empty;
+            }
             if (OriginalExists()) throw new InvalidOperationException("存在尚未恢复的网络备份，请先恢复，不能覆盖原配置。");
             if (current.IsWifi && string.IsNullOrEmpty(current.Ssid)) throw new InvalidOperationException("无法确认当前 Wi-Fi，已停止修改网络。");
             string configuredSsid = GetConfigSsid();
@@ -2388,11 +2425,12 @@ namespace YuanxinGateway
             {
                 EnsureNetworkUnchanged(current);
                 applyStarted = true;
-                RunPowerShell(BuildEnableCommand(current, targetGateway, targetGatewayIpv6));
+                ApplyEnableNative(current.InterfaceIndex, targetGateway, targetGatewayIpv6);
                 VerifyApplied(current.InterfaceIndex, targetGateway, targetGatewayIpv6);
             }
             catch (Exception applyError)
             {
+                DiagnosticLog.Write("Enable failed: " + applyError);
                 if (!applyStarted)
                 {
                     ClearOriginal();
@@ -2404,84 +2442,98 @@ namespace YuanxinGateway
                 }
                 catch (Exception restoreError)
                 {
+                    DiagnosticLog.Write("Enable rollback failed: " + restoreError);
                     throw new InvalidOperationException("启用失败：" + applyError.Message + " 自动回滚未完成，备份已保留：" + restoreError.Message, applyError);
                 }
                 throw new InvalidOperationException("启用失败，已回滚原始配置：" + applyError.Message, applyError);
             }
         }
 
-        private static string BuildEnableCommand(WifiConfig current, string targetGateway, string targetGatewayIpv6)
+        private static void ApplyEnableNative(int interfaceIndex, string targetGateway, string targetGatewayIpv6)
         {
-            string command = "$idx=" + current.InterfaceIndex + ";"
-                + "$gw='" + EscapePowerShell(targetGateway) + "';"
-                + "$ErrorActionPreference='Stop';"
-                + PowerShellNormalizeFunction()
-                + PowerShellDnsFunction()
-                + "$gwNorm=Normalize-Address $gw;"
-                + "foreach($store in @('ActiveStore','PersistentStore')){"
-                + "Get-NetRoute -PolicyStore $store -ErrorAction Stop | Where-Object { $_.InterfaceIndex -eq $idx -and $_.DestinationPrefix -eq '0.0.0.0/0' } | Remove-NetRoute -Confirm:$false -ErrorAction Stop;"
-                + "}"
-                + "New-NetRoute -InterfaceIndex $idx -DestinationPrefix '0.0.0.0/0' -NextHop $gw -RouteMetric 0 -ErrorAction Stop;";
+            string gwNorm = NormalizeAddressText(targetGateway);
+            foreach (RouteEntry entry in NativeNetwork.GetDefaultRoutes(interfaceIndex, AddressFamily.InterNetwork))
+            {
+                NativeNetwork.DeleteRoute(entry);
+            }
+            NativeNetwork.CreateOrSetDefaultRoute(interfaceIndex, "0.0.0.0/0", targetGateway, 0);
 
             if (!string.IsNullOrEmpty(targetGatewayIpv6))
             {
-                string gw6 = EscapePowerShell(targetGatewayIpv6);
-                command += "$gw6='" + gw6 + "';"
-                    + "foreach($store in @('ActiveStore','PersistentStore')){Get-NetRoute -PolicyStore $store -ErrorAction Stop | Where-Object { $_.InterfaceIndex -eq $idx -and $_.DestinationPrefix -eq '::/0' } | Remove-NetRoute -Confirm:$false -ErrorAction Stop;}"
-                    + "$gw6Scoped=Add-ScopeIfNeeded $gw6 $idx;"
-                    + "$gw6Norm=Normalize-Address $gw6;"
-                    + "try{New-NetRoute -InterfaceIndex $idx -DestinationPrefix '::/0' -NextHop $gw6 -RouteMetric 0 -ErrorAction Stop;}catch{New-NetRoute -InterfaceIndex $idx -DestinationPrefix '::/0' -NextHop $gw6Scoped -RouteMetric 0 -ErrorAction Stop;}"
-                    + "Set-DnsFamily 'ipv4' $idx @($gw);"
-                    + "Set-DnsFamily 'ipv6' $idx @($gw6);";
-            }
-            else
-            {
-                command += "Set-DnsFamily 'ipv4' $idx @($gw);";
+                foreach (RouteEntry entry in NativeNetwork.GetDefaultRoutes(interfaceIndex, AddressFamily.InterNetworkV6))
+                {
+                    NativeNetwork.DeleteRoute(entry);
+                }
+                NativeNetwork.CreateOrSetDefaultRoute(interfaceIndex, "::/0", targetGatewayIpv6, 0);
             }
 
-            command += "Clear-DnsClientCache -ErrorAction SilentlyContinue;"
-                + "Register-DnsClient -ErrorAction SilentlyContinue;"
-                // DHCP/network reconfiguration can recreate the original default route.
-                + "foreach($store in @('ActiveStore','PersistentStore')){"
-                + "Get-NetRoute -PolicyStore $store -ErrorAction SilentlyContinue | "
-                + "Where-Object { $_.InterfaceIndex -eq $idx -and $_.DestinationPrefix -eq '0.0.0.0/0' -and (Normalize-Address $_.NextHop) -ne $gwNorm } | "
-                + "Remove-NetRoute -Confirm:$false -ErrorAction SilentlyContinue;"
-                + "};";
+            SetDnsServersNative(interfaceIndex, false, new List<string> { targetGateway });
+            if (!string.IsNullOrEmpty(targetGatewayIpv6))
+            {
+                SetDnsServersNative(interfaceIndex, true, new List<string> { targetGatewayIpv6 });
+            }
+
+            NativeNetwork.FlushDnsCache();
+
+            // Clean up any competing IPv4 default route re-injected by DHCP during configuration.
+            foreach (RouteEntry entry in NativeNetwork.GetDefaultRoutes(interfaceIndex, AddressFamily.InterNetwork))
+            {
+                if (!AddressesEqual(entry.NextHop, gwNorm))
+                {
+                    try { NativeNetwork.DeleteRoute(entry); } catch { }
+                }
+            }
 
             if (!string.IsNullOrEmpty(targetGatewayIpv6))
             {
-                command += "foreach($store in @('ActiveStore','PersistentStore')){"
-                    + "Get-NetRoute -PolicyStore $store -ErrorAction SilentlyContinue | "
-                    + "Where-Object { $_.InterfaceIndex -eq $idx -and $_.DestinationPrefix -eq '::/0' -and (Normalize-Address $_.NextHop) -ne $gw6Norm } | "
-                    + "Remove-NetRoute -Confirm:$false -ErrorAction SilentlyContinue;"
-                    + "};";
+                string gw6Norm = NormalizeAddressText(targetGatewayIpv6);
+                foreach (RouteEntry entry in NativeNetwork.GetDefaultRoutes(interfaceIndex, AddressFamily.InterNetworkV6))
+                {
+                    if (!AddressesEqual(entry.NextHop, gw6Norm) && entry.Metric == 0)
+                    {
+                        try { NativeNetwork.DeleteRoute(entry); } catch { }
+                    }
+                }
+            }
+        }
+
+        private static void RepairTargetRoutesNative(int interfaceIndex, string targetGateway, string targetGatewayIpv6)
+        {
+            RepairFamilyRoutesNative(interfaceIndex, "0.0.0.0/0", AddressFamily.InterNetwork, targetGateway);
+            if (!string.IsNullOrEmpty(targetGatewayIpv6))
+            {
+                RepairFamilyRoutesNative(interfaceIndex, "::/0", AddressFamily.InterNetworkV6, targetGatewayIpv6);
+            }
+        }
+
+        private static void RepairFamilyRoutesNative(int interfaceIndex, string prefix, AddressFamily family, string target)
+        {
+            string targetNorm = NormalizeAddressText(target);
+            List<RouteEntry> routes = NativeNetwork.GetDefaultRoutes(interfaceIndex, family);
+            RouteEntry targetEntry = routes.Find(r => AddressesEqual(r.NextHop, targetNorm));
+            if (targetEntry == null)
+            {
+                NativeNetwork.CreateOrSetDefaultRoute(interfaceIndex, prefix, target, 0);
+                routes = NativeNetwork.GetDefaultRoutes(interfaceIndex, family);
+                targetEntry = routes.Find(r => AddressesEqual(r.NextHop, targetNorm));
+                if (targetEntry == null)
+                {
+                    throw new InvalidOperationException("未能建立目标路由，已保留其他默认路由。");
+                }
+            }
+            else if (targetEntry.Metric != 0)
+            {
+                NativeNetwork.CreateOrSetDefaultRoute(interfaceIndex, prefix, target, 0);
             }
 
-            return command;
-        }
-
-        private static string RouteGuardSetup(int interfaceIndex, string targetGateway, string targetGatewayIpv6)
-        {
-            return "$ErrorActionPreference='Stop';$idx=" + interfaceIndex + ";"
-                + PowerShellNormalizeFunction()
-                + "$families=@(@{Prefix='0.0.0.0/0';Target='" + EscapePowerShell(targetGateway) + "'}"
-                + (string.IsNullOrEmpty(targetGatewayIpv6) ? "" : ",@{Prefix='::/0';Target='" + EscapePowerShell(targetGatewayIpv6) + "'}")
-                + ");";
-        }
-
-        private static string BuildRepairTargetCommand(int interfaceIndex, string targetGateway, string targetGatewayIpv6)
-        {
-            return RouteGuardSetup(interfaceIndex, targetGateway, targetGatewayIpv6)
-                + "foreach($family in $families){$prefix=$family.Prefix;$targetNorm=Normalize-Address $family.Target;"
-                + "$active=@(Get-NetRoute -PolicyStore ActiveStore -ErrorAction Stop | Where-Object { $_.InterfaceIndex -eq $idx -and $_.DestinationPrefix -eq $prefix -and (Normalize-Address $_.NextHop) -eq $targetNorm });"
-                + "if($active.Count -eq 0){$hop=Add-ScopeIfNeeded $family.Target $idx;New-NetRoute -InterfaceIndex $idx -DestinationPrefix $prefix -NextHop $hop -RouteMetric 0 -PolicyStore ActiveStore -ErrorAction Stop | Out-Null;}"
-                + "$active=@(Get-NetRoute -PolicyStore ActiveStore -ErrorAction Stop | Where-Object { $_.InterfaceIndex -eq $idx -and $_.DestinationPrefix -eq $prefix -and (Normalize-Address $_.NextHop) -eq $targetNorm });"
-                + "if($active.Count -eq 0){throw '未能建立目标路由，已保留其他默认路由。'}"
-                + "foreach($store in @('PersistentStore','ActiveStore')){"
-                + "$routes=@(Get-NetRoute -PolicyStore $store -ErrorAction Stop | Where-Object { $_.InterfaceIndex -eq $idx -and $_.DestinationPrefix -eq $prefix });"
-                + "foreach($route in $routes){if((Normalize-Address $route.NextHop) -eq $targetNorm){"
-                + "if($route.RouteMetric -ne 0){$route | Set-NetRoute -RouteMetric 0 -Confirm:$false -ErrorAction Stop | Out-Null;}"
-                + "}else{Remove-NetRoute -PolicyStore $store -InterfaceIndex $idx -DestinationPrefix $prefix -NextHop $route.NextHop -Confirm:$false -ErrorAction Stop;}}}}";
+            // Only remove competing routes whose metric could actually preempt or tie with our target (metric 0).
+            foreach (RouteEntry route in routes)
+            {
+                if (!AddressesEqual(route.NextHop, targetNorm) && route.Metric == 0)
+                {
+                    NativeNetwork.DeleteRoute(route);
+                }
+            }
         }
 
         public static void Restore(string targetGateway)
@@ -2504,82 +2556,98 @@ namespace YuanxinGateway
                 throw new InvalidOperationException("无法确认当前 Wi-Fi，暂不恢复，备份已保留。");
             }
             bool sameNetwork = IsSameNetwork(original, current);
-            bool restoreIpv6 = !string.IsNullOrEmpty(original.TargetGatewayIpv6);
+            bool restoreIpv6 = !string.IsNullOrEmpty(original.TargetGatewayIpv6) && current.SupportsIpv6;
             if (!sameNetwork && (!original.IsDnsDhcp || (restoreIpv6 && !original.IsIpv6DnsDhcp)))
             {
                 throw new InvalidOperationException("网络已变化，不能将旧网络的静态 DNS 写入新网络。请回到原网络恢复，备份已保留。");
             }
-            EnsureNetworkUnchanged(current);
-            RunPowerShell(BuildRestoreCommand(original, index, sameNetwork));
-            EnsureNetworkUnchanged(current);
-            original.InterfaceId = current.InterfaceId;
-            VerifyRestored(original, index, sameNetwork);
-            EnsureNetworkUnchanged(current);
-            ClearOriginal();
+            try
+            {
+                EnsureNetworkUnchanged(current);
+                ApplyRestoreNative(original, index, sameNetwork, restoreIpv6);
+                EnsureNetworkUnchanged(current);
+                original.InterfaceId = current.InterfaceId;
+                VerifyRestored(original, index, sameNetwork, restoreIpv6);
+                EnsureNetworkUnchanged(current);
+                ClearOriginal();
+            }
+            catch (Exception ex)
+            {
+                DiagnosticLog.Write("Restore failed: " + ex);
+                throw;
+            }
         }
 
-        private static string BuildRestoreCommand(OriginalConfig original, int index, bool sameNetwork)
+        private static void ApplyRestoreNative(OriginalConfig original, int index, bool sameNetwork, bool restoreIpv6)
         {
             string targetGateway = !string.IsNullOrEmpty(original.TargetGateway) ? original.TargetGateway : GetConfigGatewayIp();
             string targetGatewayIpv6 = original.TargetGatewayIpv6 ?? string.Empty;
-            bool restoreIpv6 = !string.IsNullOrEmpty(targetGatewayIpv6);
+            List<SavedRouteRecord> savedRoutes = ParseSavedRoutes(original);
+            if (original.ExcludeTargetRoutes && !savedRoutes.Exists(r => r.DestinationPrefix == "0.0.0.0/0"))
+            {
+                throw new InvalidOperationException("备份只有旁路由网关，无法确定原网关；已停止恢复并保留备份。");
+            }
+
             List<string> cleanDns4 = original.DnsServers.FindAll(d => !d.Contains(":"));
             List<string> cleanDns6 = original.DnsServers.FindAll(d => d.Contains(":"));
             bool useDhcpV4 = original.IsDnsDhcp || cleanDns4.Count == 0;
             bool useDhcpV6 = original.IsIpv6DnsDhcp || cleanDns6.Count == 0;
 
-            string command = "$ErrorActionPreference='Stop';$idx=" + index + ";"
-                + "$target='" + EscapePowerShell(targetGateway) + "';"
-                + PowerShellNormalizeFunction()
-                + PowerShellDnsFunction()
-                + (original.ExcludeTargetRoutes ? SavedRoutesCommand(original)
-                    + "if(-not ($savedRoutes | Where-Object { $_.DestinationPrefix -eq '0.0.0.0/0' })){throw '备份只有旁路由网关，无法确定原网关；已停止恢复并保留备份。'};" : "")
-                + "$dns4=@(" + QuotePowerShellArray(cleanDns4) + ");"
-                + "$dns6=@(" + QuotePowerShellArray(cleanDns6) + ");"
-                + (useDhcpV4 ? "Get-DnsClientServerAddress -InterfaceIndex $idx -AddressFamily 'IPv4' -ErrorAction Stop | Set-DnsClientServerAddress -ResetServerAddresses -Confirm:$false;"
-                    : "Get-DnsClientServerAddress -InterfaceIndex $idx -AddressFamily 'IPv4' -ErrorAction Stop | Set-DnsClientServerAddress -ServerAddresses $dns4 -Confirm:$false;")
-                + (restoreIpv6 ? (useDhcpV6 ? "Get-DnsClientServerAddress -InterfaceIndex $idx -AddressFamily 'IPv6' -ErrorAction Stop | Set-DnsClientServerAddress -ResetServerAddresses -Confirm:$false;"
-                    : "Get-DnsClientServerAddress -InterfaceIndex $idx -AddressFamily 'IPv6' -ErrorAction Stop | Set-DnsClientServerAddress -ServerAddresses $dns6 -Confirm:$false;") : "")
-                + "function Remove-TargetRoutes($prefix,$targetNorm){"
-                + "for($attempt=0;$attempt -lt 3;$attempt++){"
-                + "$found=$false;"
-                + "foreach($store in @('PersistentStore','ActiveStore')){"
-                + "$routes=@(Get-NetRoute -PolicyStore $store -ErrorAction Stop | "
-                + "Where-Object { $_.InterfaceIndex -eq $idx -and $_.DestinationPrefix -eq $prefix -and (Normalize-Address $_.NextHop) -eq $targetNorm });"
-                + "foreach($route in $routes){$found=$true;"
-                + "Remove-NetRoute -PolicyStore $store -InterfaceIndex $idx -DestinationPrefix $prefix -NextHop $route.NextHop -Confirm:$false -ErrorAction Stop;}"
-                + "}"
-                + "if(-not $found){break;}"
-                + "Start-Sleep -Milliseconds 100;"
-                + "}"
-                + "$remaining=@(foreach($store in @('PersistentStore','ActiveStore')){Get-NetRoute -PolicyStore $store -ErrorAction Stop | "
-                + "Where-Object { $_.InterfaceIndex -eq $idx -and $_.DestinationPrefix -eq $prefix -and (Normalize-Address $_.NextHop) -eq $targetNorm }});"
-                + "if($remaining.Count -gt 0){throw ('无法删除目标默认路由 ' + $prefix + ': ' + (($remaining | ForEach-Object { $_.NextHop }) -join ', '))};"
-                + "};"
-                + "Remove-TargetRoutes '0.0.0.0/0' (Normalize-Address $target);";
+            SetDnsServersNative(index, false, useDhcpV4 ? null : cleanDns4);
+            if (restoreIpv6)
+            {
+                SetDnsServersNative(index, true, useDhcpV6 ? null : cleanDns6);
+            }
 
+            RemoveTargetRoutesNative(index, "0.0.0.0/0", AddressFamily.InterNetwork, targetGateway);
             if (!string.IsNullOrEmpty(targetGatewayIpv6))
             {
-                command += "$target6='" + EscapePowerShell(targetGatewayIpv6) + "';"
-                    + "$target6Norm=Normalize-Address $target6;"
-                    + "Remove-TargetRoutes '::/0' $target6Norm;";
+                RemoveTargetRoutesNative(index, "::/0", AddressFamily.InterNetworkV6, targetGatewayIpv6);
             }
 
             if (sameNetwork)
             {
-                command += RestoreRoutesCommand(original);
+                RestoreRoutesNative(original, index, savedRoutes);
             }
 
             // DHCP can recreate a default route while the interface is being reset.
-            command += "Remove-TargetRoutes '0.0.0.0/0' (Normalize-Address $target);";
-            if (restoreIpv6)
+            RemoveTargetRoutesNative(index, "0.0.0.0/0", AddressFamily.InterNetwork, targetGateway);
+            if (!string.IsNullOrEmpty(targetGatewayIpv6))
             {
-                command += "Remove-TargetRoutes '::/0' $target6Norm;";
+                RemoveTargetRoutesNative(index, "::/0", AddressFamily.InterNetworkV6, targetGatewayIpv6);
             }
-            command += "Clear-DnsClientCache -ErrorAction SilentlyContinue;"
-                + "Register-DnsClient -ErrorAction SilentlyContinue;";
 
-            return command;
+            NativeNetwork.FlushDnsCache();
+        }
+
+        private static void RemoveTargetRoutesNative(int interfaceIndex, string prefix, AddressFamily family, string targetGateway)
+        {
+            string targetNorm = NormalizeAddressText(targetGateway);
+            if (string.IsNullOrEmpty(targetNorm)) return;
+
+            for (int attempt = 0; attempt < 3; attempt++)
+            {
+                bool found = false;
+                foreach (RouteEntry route in NativeNetwork.GetDefaultRoutes(interfaceIndex, family))
+                {
+                    if (AddressesEqual(route.NextHop, targetNorm))
+                    {
+                        found = true;
+                        NativeNetwork.DeleteRoute(route);
+                    }
+                }
+                if (!found) break;
+                Thread.Sleep(100);
+            }
+
+            List<RouteEntry> remaining = NativeNetwork.GetDefaultRoutes(interfaceIndex, family)
+                .FindAll(r => AddressesEqual(r.NextHop, targetNorm));
+            if (remaining.Count > 0)
+            {
+                List<string> hops = new List<string>();
+                foreach (RouteEntry r in remaining) hops.Add(r.NextHop);
+                throw new InvalidOperationException("无法删除目标默认路由 " + prefix + ": " + string.Join(", ", hops.ToArray()));
+            }
         }
 
         private static void SaveOriginal(WifiConfig config, string targetGateway, string targetGatewayIpv6)
@@ -2589,7 +2657,7 @@ namespace YuanxinGateway
                 throw new InvalidOperationException("已有待恢复的配置，不能覆盖备份。");
             }
 
-            string routesJson = RunPowerShell(BuildCaptureRoutesCommand(config, targetGatewayIpv6)).Trim();
+            string routesJson = CaptureRoutesJsonNative(config.InterfaceIndex, targetGatewayIpv6);
             EnsureNetworkUnchanged(config);
 
             using (RegistryKey key = Registry.CurrentUser.CreateSubKey(RegistryPath + "\\Original"))
@@ -2612,12 +2680,42 @@ namespace YuanxinGateway
             }
         }
 
-        private static string BuildCaptureRoutesCommand(WifiConfig config, string targetGatewayIpv6)
+        private static string CaptureRoutesJsonNative(int interfaceIndex, string targetGatewayIpv6)
         {
-            string prefixes = string.IsNullOrEmpty(targetGatewayIpv6) ? "@('0.0.0.0/0')" : "@('0.0.0.0/0','::/0')";
-            return "$ErrorActionPreference='Stop';$idx=" + config.InterfaceIndex + ";$prefixes=" + prefixes + ";"
-                + "$routes=@(foreach($store in @('PersistentStore','ActiveStore')){Get-NetRoute -PolicyStore $store -ErrorAction Stop | Where-Object { $_.InterfaceIndex -eq $idx -and $prefixes -contains $_.DestinationPrefix } | ForEach-Object { [pscustomobject]@{PolicyStore=$store;DestinationPrefix=$_.DestinationPrefix;NextHop=$_.NextHop;RouteMetric=$_.RouteMetric} }});"
-                + "if(-not ($routes | Where-Object { $_.PolicyStore -eq 'ActiveStore' -and $_.DestinationPrefix -eq '0.0.0.0/0' })){throw '没有可备份的 IPv4 默认路由。'};ConvertTo-Json -InputObject $routes -Compress";
+            bool includeV6 = !string.IsNullOrEmpty(targetGatewayIpv6);
+            List<RouteEntry> routes = NativeNetwork.GetDefaultRoutes(interfaceIndex);
+            List<SavedRouteRecord> captured = new List<SavedRouteRecord>();
+            bool hasV4 = false;
+            foreach (RouteEntry route in routes)
+            {
+                if (route.DestinationPrefix == "0.0.0.0/0")
+                {
+                    hasV4 = true;
+                }
+                else if (!includeV6 || route.DestinationPrefix != "::/0")
+                {
+                    continue;
+                }
+                captured.Add(new SavedRouteRecord
+                {
+                    PolicyStore = route.PolicyStore,
+                    DestinationPrefix = route.DestinationPrefix,
+                    NextHop = route.NextHop,
+                    RouteMetric = (int)route.Metric
+                });
+            }
+
+            if (!hasV4)
+            {
+                throw new InvalidOperationException("没有可备份的 IPv4 默认路由。");
+            }
+
+            DataContractJsonSerializer serializer = new DataContractJsonSerializer(typeof(List<SavedRouteRecord>));
+            using (MemoryStream stream = new MemoryStream())
+            {
+                serializer.WriteObject(stream, captured);
+                return Encoding.UTF8.GetString(stream.ToArray());
+            }
         }
 
         private static bool OriginalExists()
@@ -2714,15 +2812,41 @@ namespace YuanxinGateway
             if (!config.DnsServers.Exists(d => d.Contains(":"))) config.IsIpv6DnsDhcp = true;
         }
 
-        private static string SavedRoutesCommand(OriginalConfig original)
+        private static List<SavedRouteRecord> ParseSavedRoutes(OriginalConfig original)
         {
-            string command = "$savedRoutes=ConvertFrom-Json '" + EscapePowerShell(original.RoutesJson) + "';";
-            return command
-                + "$backupTarget4='" + EscapePowerShell(NormalizeAddressText(original.TargetGateway)) + "';"
-                + "$backupTarget6='" + EscapePowerShell(NormalizeAddressText(original.TargetGatewayIpv6)) + "';"
-                + "$savedRoutes=@($savedRoutes | Where-Object {"
-                + "-not (($_.DestinationPrefix -eq '0.0.0.0/0' -and $backupTarget4 -and (Normalize-Address $_.NextHop) -eq $backupTarget4)"
-                + " -or ($backupTarget6 -and $_.DestinationPrefix -eq '::/0' -and (Normalize-Address $_.NextHop) -eq $backupTarget6)) });";
+            List<SavedRouteRecord> result = new List<SavedRouteRecord>();
+            if (string.IsNullOrWhiteSpace(original.RoutesJson)) return result;
+
+            string json = original.RoutesJson.Trim();
+            if (json.StartsWith("{"))
+            {
+                // PowerShell ConvertTo-Json emits a single object instead of an array when count == 1.
+                json = "[" + json + "]";
+            }
+
+            DataContractJsonSerializer serializer = new DataContractJsonSerializer(typeof(List<SavedRouteRecord>));
+            using (MemoryStream stream = new MemoryStream(Encoding.UTF8.GetBytes(json)))
+            {
+                List<SavedRouteRecord> parsed = serializer.ReadObject(stream) as List<SavedRouteRecord>;
+                if (parsed != null)
+                {
+                    string target4 = NormalizeAddressText(original.TargetGateway);
+                    string target6 = NormalizeAddressText(original.TargetGatewayIpv6);
+                    foreach (SavedRouteRecord item in parsed)
+                    {
+                        if (item == null || string.IsNullOrWhiteSpace(item.DestinationPrefix) || string.IsNullOrWhiteSpace(item.NextHop))
+                            continue;
+                        string normHop = NormalizeAddressText(item.NextHop);
+                        bool isTarget4 = item.DestinationPrefix == "0.0.0.0/0" && !string.IsNullOrEmpty(target4) && normHop == target4;
+                        bool isTarget6 = item.DestinationPrefix == "::/0" && !string.IsNullOrEmpty(target6) && normHop == target6;
+                        if (!isTarget4 && !isTarget6)
+                        {
+                            result.Add(item);
+                        }
+                    }
+                }
+            }
+            return result;
         }
 
         private static bool IsSameNetwork(OriginalConfig original, WifiConfig current)
@@ -2767,71 +2891,80 @@ namespace YuanxinGateway
                 throw new InvalidOperationException("操作期间网络已变化，已停止处理并保留备份。");
         }
 
-        private static string RestoreRoutesCommand(OriginalConfig original)
+        private static void RestoreRoutesNative(OriginalConfig original, int index, List<SavedRouteRecord> savedRoutes)
         {
-            if (!string.IsNullOrEmpty(original.RoutesJson))
+            if (savedRoutes != null && savedRoutes.Count > 0)
             {
-                return SavedRoutesCommand(original)
-                    + "foreach($saved in $savedRoutes){$next=Normalize-Address $saved.NextHop;"
-                    + "$existing=@(Get-NetRoute -PolicyStore $saved.PolicyStore -ErrorAction SilentlyContinue | Where-Object { $_.InterfaceIndex -eq $idx -and $_.DestinationPrefix -eq $saved.DestinationPrefix -and (Normalize-Address $_.NextHop) -eq (Normalize-Address $saved.NextHop) });"
-                    + "if($existing.Count -eq 0){$options=@{InterfaceIndex=$idx;DestinationPrefix=$saved.DestinationPrefix;NextHop=$next;RouteMetric=$saved.RouteMetric;ErrorAction='Stop'};if($saved.PolicyStore -eq 'ActiveStore' -or $saved.PolicyStore -eq 'PersistentStore'){$options.PolicyStore=$saved.PolicyStore};"
-                    + "try{New-NetRoute @options | Out-Null;}catch{if($next -notlike 'fe80:*'){throw};$options.NextHop=$next + '%' + $idx;New-NetRoute @options | Out-Null;}}"
-                    + "else{$existing | Where-Object { $_.RouteMetric -ne $saved.RouteMetric } | Set-NetRoute -RouteMetric $saved.RouteMetric -Confirm:$false -ErrorAction Stop | Out-Null;}}";
+                foreach (SavedRouteRecord saved in savedRoutes)
+                {
+                    string next = NormalizeAddressText(saved.NextHop);
+                    if (string.IsNullOrEmpty(next)) continue;
+                    NativeNetwork.CreateOrSetDefaultRoute(index, saved.DestinationPrefix, next, (uint)Math.Max(0, saved.RouteMetric));
+                }
+                return;
             }
 
-            string legacyCmd = string.Empty;
             if (!string.IsNullOrEmpty(original.Gateway))
             {
-                legacyCmd += "$oldgw='" + EscapePowerShell(original.Gateway) + "';"
-                    + "$existingV4=@(Get-NetRoute -InterfaceIndex $idx -DestinationPrefix '0.0.0.0/0' -ErrorAction SilentlyContinue | Where-Object { $_.NextHop -eq $oldgw });"
-                    + "if($existingV4.Count -eq 0){New-NetRoute -InterfaceIndex $idx -DestinationPrefix '0.0.0.0/0' -NextHop $oldgw -RouteMetric 10 -PolicyStore ActiveStore -ErrorAction SilentlyContinue | Out-Null;}";
+                try { NativeNetwork.CreateOrSetDefaultRoute(index, "0.0.0.0/0", original.Gateway, 10); } catch { }
             }
-            if (original.Ipv6Gateways.Count > 0)
+            foreach (string old in original.Ipv6Gateways)
             {
-                legacyCmd += "$oldgw6=@(" + QuotePowerShellArray(original.Ipv6Gateways) + ");"
-                    + "foreach($old in $oldgw6){if([string]::IsNullOrWhiteSpace($old)){continue;}"
-                    + "$oldNorm=Normalize-Address $old;"
-                    + "$existingV6=@(Get-NetRoute -InterfaceIndex $idx -DestinationPrefix '::/0' -ErrorAction SilentlyContinue | Where-Object { (Normalize-Address $_.NextHop) -eq $oldNorm });"
-                    + "if($existingV6.Count -eq 0){"
-                    + "$oldScoped=Add-ScopeIfNeeded $old $idx;"
-                    + "try{New-NetRoute -InterfaceIndex $idx -DestinationPrefix '::/0' -NextHop $old -RouteMetric 10 -PolicyStore ActiveStore -ErrorAction SilentlyContinue | Out-Null;}"
-                    + "catch{New-NetRoute -InterfaceIndex $idx -DestinationPrefix '::/0' -NextHop $oldScoped -RouteMetric 10 -PolicyStore ActiveStore -ErrorAction SilentlyContinue | Out-Null;}"
-                    + "}}";
+                if (string.IsNullOrWhiteSpace(old)) continue;
+                try { NativeNetwork.CreateOrSetDefaultRoute(index, "::/0", old, 10); } catch { }
             }
-            return legacyCmd;
         }
 
-        private static void VerifyRestored(OriginalConfig original, int index, bool sameNetwork)
+        private static void VerifyRestored(OriginalConfig original, int index, bool sameNetwork, bool restoreIpv6)
         {
-            RunPowerShell(BuildVerifyRoutesCommand(original, index, sameNetwork));
+            VerifyRoutesRestoredNative(original, index, sameNetwork);
             VerifyDnsRestored(original, index, false);
-            if (!string.IsNullOrEmpty(original.TargetGatewayIpv6)) VerifyDnsRestored(original, index, true);
+            if (restoreIpv6) VerifyDnsRestored(original, index, true);
         }
 
-        private static string BuildVerifyRoutesCommand(OriginalConfig original, int index, bool sameNetwork)
+        private static void VerifyRoutesRestoredNative(OriginalConfig original, int index, bool sameNetwork)
         {
             string target4 = !string.IsNullOrEmpty(original.TargetGateway) ? original.TargetGateway : GetConfigGatewayIp();
             string target6 = original.TargetGatewayIpv6 ?? string.Empty;
+            List<RouteEntry> routes = NativeNetwork.GetDefaultRoutes(index);
+            List<SavedRouteRecord> savedRoutes = ParseSavedRoutes(original);
 
-            if (!string.IsNullOrEmpty(original.RoutesJson))
+            foreach (RouteEntry route in routes)
             {
-                return "$ErrorActionPreference='Stop';$idx=" + index + ";" + PowerShellNormalizeFunction()
-                    + SavedRoutesCommand(original)
-                    + "$target4='" + EscapePowerShell(target4) + "';$target6='" + EscapePowerShell(target6) + "';"
-                    + "$same=" + (sameNetwork ? "$true" : "$false") + ";"
-                    + "foreach($store in @('PersistentStore','ActiveStore')){$routes=@(Get-NetRoute -PolicyStore $store -ErrorAction SilentlyContinue | Where-Object { $_.InterfaceIndex -eq $idx });"
-                    + "foreach($route in $routes){$owned=($route.DestinationPrefix -eq '0.0.0.0/0' -and $route.NextHop -eq $target4) -or ($target6 -and $route.DestinationPrefix -eq '::/0' -and (Normalize-Address $route.NextHop) -eq (Normalize-Address $target6));"
-                    + "$wasOriginal=$same -and @($savedRoutes | Where-Object { $_.PolicyStore -eq $store -and $_.DestinationPrefix -eq $route.DestinationPrefix -and (Normalize-Address $_.NextHop) -eq (Normalize-Address $route.NextHop) }).Count -gt 0;"
-                    + "if($owned -and -not $wasOriginal){throw '目标旁路由仍有残留路由，备份已保留。'}}"
-                    + "if($same){foreach($saved in @($savedRoutes | Where-Object { $_.PolicyStore -eq $store })){if(-not ($routes | Where-Object { $_.DestinationPrefix -eq $saved.DestinationPrefix -and (Normalize-Address $_.NextHop) -eq (Normalize-Address $saved.NextHop) -and $_.RouteMetric -eq $saved.RouteMetric })){throw '原始路由恢复校验失败，备份已保留。'}}}}";
+                bool owned = (route.DestinationPrefix == "0.0.0.0/0" && AddressesEqual(route.NextHop, target4)) ||
+                    (!string.IsNullOrEmpty(target6) && route.DestinationPrefix == "::/0" && AddressesEqual(route.NextHop, target6));
+                bool wasOriginal = sameNetwork && savedRoutes.Exists(s =>
+                    s.DestinationPrefix == route.DestinationPrefix && AddressesEqual(s.NextHop, route.NextHop));
+                if (owned && !wasOriginal)
+                {
+                    throw new InvalidOperationException("目标旁路由仍有残留路由，备份已保留。");
+                }
             }
 
-            return "$ErrorActionPreference='Stop';$idx=" + index + ";" + PowerShellNormalizeFunction()
-                + "$target4='" + EscapePowerShell(target4) + "';$target6='" + EscapePowerShell(target6) + "';"
-                + "foreach($store in @('PersistentStore','ActiveStore')){$routes=@(Get-NetRoute -PolicyStore $store -ErrorAction SilentlyContinue | Where-Object { $_.InterfaceIndex -eq $idx });"
-                + "foreach($route in $routes){$owned=($route.DestinationPrefix -eq '0.0.0.0/0' -and $route.NextHop -eq $target4) -or ($target6 -and $route.DestinationPrefix -eq '::/0' -and (Normalize-Address $route.NextHop) -eq (Normalize-Address $target6));"
-                + "if($owned){throw '目标旁路由仍有残留路由，备份已保留。'}}}"
-                + (sameNetwork && !string.IsNullOrEmpty(original.Gateway) ? "$v4Route=Get-NetRoute -InterfaceIndex $idx -DestinationPrefix '0.0.0.0/0' -ErrorAction SilentlyContinue | Where-Object { $_.NextHop -eq '" + EscapePowerShell(original.Gateway) + "' };if(-not $v4Route){throw '原始默认网关未恢复，备份已保留。'}" : "");
+            if (sameNetwork)
+            {
+                if (savedRoutes.Count > 0)
+                {
+                    foreach (SavedRouteRecord saved in savedRoutes)
+                    {
+                        bool matched = routes.Exists(r =>
+                            r.DestinationPrefix == saved.DestinationPrefix &&
+                            AddressesEqual(r.NextHop, saved.NextHop) &&
+                            r.Metric == (uint)Math.Max(0, saved.RouteMetric));
+                        if (!matched)
+                        {
+                            throw new InvalidOperationException("原始路由恢复校验失败，备份已保留。");
+                        }
+                    }
+                }
+                else if (!string.IsNullOrEmpty(original.Gateway))
+                {
+                    if (!routes.Exists(r => r.DestinationPrefix == "0.0.0.0/0" && AddressesEqual(r.NextHop, original.Gateway)))
+                    {
+                        throw new InvalidOperationException("原始默认网关未恢复，备份已保留。");
+                    }
+                }
+            }
         }
 
         private static void VerifyDnsRestored(OriginalConfig original, int index, bool ipv6)
@@ -2848,16 +2981,18 @@ namespace YuanxinGateway
                 if (!dhcp && actualDhcp) throw new InvalidOperationException("DNS 获取方式恢复失败（未写入静态 DNS），备份已保留。");
             }
             if (dhcp) return;
-            RunPowerShell(BuildVerifyDnsCommand(original, index, ipv6));
-        }
 
-        private static string BuildVerifyDnsCommand(OriginalConfig original, int index, bool ipv6)
-        {
-            List<string> expected = original.DnsServers.FindAll(address => address.Contains(":") == ipv6);
-            return "$ErrorActionPreference='Stop';" + PowerShellNormalizeFunction()
-                + "$expected=@(@(" + QuotePowerShellArray(expected) + ") | ForEach-Object { Normalize-Address $_ });"
-                + "$actual=@((Get-DnsClientServerAddress -InterfaceIndex " + index + " -AddressFamily " + (ipv6 ? "IPv6" : "IPv4") + " -ErrorAction Stop).ServerAddresses | ForEach-Object { Normalize-Address $_ });"
-                + "if(($expected -join ',') -ne ($actual -join ',')){throw '静态 DNS 恢复校验失败，备份已保留。'}";
+            List<string> actual = GetInterfaceDnsAddresses(index, ipv6 ? AddressFamily.InterNetworkV6 : AddressFamily.InterNetwork);
+            List<string> expected = new List<string>();
+            foreach (string addr in cleanDns)
+            {
+                string norm = NormalizeAddressText(addr);
+                if (!string.IsNullOrEmpty(norm)) expected.Add(norm);
+            }
+            if (string.Join(",", expected.ToArray()) != string.Join(",", actual.ToArray()))
+            {
+                throw new InvalidOperationException("静态 DNS 恢复校验失败，备份已保留。");
+            }
         }
 
         private static void ClearOriginal()
@@ -2955,49 +3090,109 @@ namespace YuanxinGateway
             return candidate.ToLowerInvariant();
         }
 
-        private static string PowerShellNormalizeFunction()
+        private static void SetDnsServersNative(int interfaceIndex, bool ipv6, List<string> servers)
         {
-            return "function Normalize-Address($value){if($null -eq $value){return ''}$text=$value.ToString().Trim();$slash=$text.IndexOf('/');if($slash -ge 0){$text=$text.Substring(0,$slash)}$zone=$text.IndexOf('%');if($zone -ge 0){$text=$text.Substring(0,$zone)}return $text.ToLowerInvariant();};"
-                + "function Add-ScopeIfNeeded($value,$idx){$text=$value.ToString();if($text -like 'fe80:*' -and $text -notlike '*%*'){return ($text + '%' + $idx)}return $text;};";
+            string family = ipv6 ? "ipv6" : "ipv4";
+            List<string> clean = new List<string>();
+            if (servers != null)
+            {
+                foreach (string s in servers)
+                {
+                    string norm = NormalizeAddressText(s);
+                    if (!string.IsNullOrEmpty(norm) && !clean.Contains(norm))
+                    {
+                        clean.Add(norm);
+                    }
+                }
+            }
+
+            if (clean.Count == 0)
+            {
+                RunCommand("netsh.exe", string.Format("interface {0} set dnsservers name={1} source=dhcp", family, interfaceIndex), 10000);
+                return;
+            }
+
+            RunCommand("netsh.exe", string.Format("interface {0} set dnsservers name={1} source=static address={2} validate=no",
+                family, interfaceIndex, QuoteWindowsCommandLineArgument(clean[0])), 10000);
+
+            for (int i = 1; i < clean.Count; i++)
+            {
+                RunCommand("netsh.exe", string.Format("interface {0} add dnsservers name={1} address={2} index={3} validate=no",
+                    family, interfaceIndex, QuoteWindowsCommandLineArgument(clean[i]), i + 1), 10000);
+            }
         }
 
-        private static string PowerShellDnsFunction()
+        private static List<string> GetInterfaceDnsAddresses(int interfaceIndex, AddressFamily? filterFamily = null)
         {
-            return "function Set-DnsFamily($family,$idx,[string[]]$addresses){"
-                + "$clean=@();if($null -ne $addresses){$clean=@($addresses | ForEach-Object { Normalize-Address $_ } | Where-Object { -not [string]::IsNullOrWhiteSpace($_) });}"
-                + "$familyName=if($family -eq 'ipv4'){'IPv4'}else{'IPv6'};"
-                + "$target=@(Get-DnsClientServerAddress -InterfaceIndex $idx -AddressFamily $familyName -ErrorAction Stop);"
-                + "if($target.Count -eq 0){throw ($familyName + ' DNS 配置不可用');}"
-                + "if($clean.Count -eq 0){$target | Set-DnsClientServerAddress -ResetServerAddresses -Confirm:$false -ErrorAction Stop;return;}"
-                + "$target | Set-DnsClientServerAddress -ServerAddresses $clean -Confirm:$false -ErrorAction Stop;};";
+            List<string> result = new List<string>();
+            foreach (NetworkInterface item in NetworkInterface.GetAllNetworkInterfaces())
+            {
+                IPInterfaceProperties props = item.GetIPProperties();
+                IPv4InterfaceProperties v4 = props.GetIPv4Properties();
+                int idx = v4 != null ? v4.Index : 0;
+                if (idx != interfaceIndex && filterFamily == AddressFamily.InterNetworkV6)
+                {
+                    IPv6InterfaceProperties v6 = null;
+                    try { v6 = props.GetIPv6Properties(); } catch { }
+                    if (v6 != null) idx = v6.Index;
+                }
+                if (idx != interfaceIndex) continue;
+
+                foreach (IPAddress dns in props.DnsAddresses)
+                {
+                    if (filterFamily.HasValue && dns.AddressFamily != filterFamily.Value) continue;
+                    if (dns.AddressFamily != AddressFamily.InterNetwork && dns.AddressFamily != AddressFamily.InterNetworkV6) continue;
+                    string norm = NormalizeAddressText(dns.ToString());
+                    if (!string.IsNullOrEmpty(norm) && !result.Contains(norm))
+                    {
+                        result.Add(norm);
+                    }
+                }
+                break;
+            }
+            return result;
         }
 
         private static void VerifyApplied(int interfaceIndex, string targetGateway, string targetGatewayIpv6)
         {
-            string command = "$idx=" + interfaceIndex + ";"
-                + "$gw='" + EscapePowerShell(targetGateway) + "';"
-                + PowerShellNormalizeFunction()
-                + "$dns=@((Get-DnsClientServerAddress -InterfaceIndex $idx -ErrorAction Stop).ServerAddresses | ForEach-Object { Normalize-Address $_ });"
-                + "$v4Routes=@(Get-NetRoute -PolicyStore ActiveStore -InterfaceIndex $idx -DestinationPrefix '0.0.0.0/0' -ErrorAction SilentlyContinue);"
-                + "$v4Route=$v4Routes | Where-Object { (Normalize-Address $_.NextHop) -eq (Normalize-Address $gw) } | Select-Object -First 1;"
-                + "if(-not $v4Route){throw 'IPv4 默认网关未切换到目标地址。'}"
-                + "$unexpectedV4=$v4Routes | Where-Object { (Normalize-Address $_.NextHop) -ne (Normalize-Address $gw) };"
-                + "if($unexpectedV4){throw ('IPv4 默认路由仍存在其他网关: ' + (($unexpectedV4 | ForEach-Object { $_.NextHop }) -join ', '))}"
-                + "if(-not ($dns -contains (Normalize-Address $gw))){throw 'DNS 未包含目标 IPv4 地址。'}";
+            List<RouteEntry> routes = NativeNetwork.GetDefaultRoutes(interfaceIndex);
+            List<string> dns = GetInterfaceDnsAddresses(interfaceIndex);
 
+            VerifyAppliedFamily(routes, dns, "0.0.0.0/0", AddressFamily.InterNetwork, targetGateway, "IPv4");
             if (!string.IsNullOrEmpty(targetGatewayIpv6))
             {
-                command += "$gw6='" + EscapePowerShell(targetGatewayIpv6) + "';"
-                    + "$gw6Norm=Normalize-Address $gw6;"
-                    + "$v6Routes=@(Get-NetRoute -PolicyStore ActiveStore -InterfaceIndex $idx -DestinationPrefix '::/0' -ErrorAction SilentlyContinue);"
-                    + "$v6Route=$v6Routes | Where-Object { (Normalize-Address $_.NextHop) -eq $gw6Norm } | Select-Object -First 1;"
-                    + "if(-not $v6Route){throw 'IPv6 默认网关未切换到目标地址。'}"
-                    + "$unexpectedV6=$v6Routes | Where-Object { (Normalize-Address $_.NextHop) -ne $gw6Norm };"
-                    + "if($unexpectedV6){throw ('IPv6 默认路由仍存在其他网关: ' + (($unexpectedV6 | ForEach-Object { $_.NextHop }) -join ', '))}"
-                    + "if(-not ($dns -contains $gw6Norm)){throw 'DNS 未包含目标 IPv6 地址。'}";
+                VerifyAppliedFamily(routes, dns, "::/0", AddressFamily.InterNetworkV6, targetGatewayIpv6, "IPv6");
+            }
+        }
+
+        private static void VerifyAppliedFamily(List<RouteEntry> routes, List<string> dns, string prefix, AddressFamily family, string target, string label)
+        {
+            string targetNorm = NormalizeAddressText(target);
+            RouteEntry targetRoute = routes.Find(r => r.Family == family && AddressesEqual(r.NextHop, targetNorm));
+            if (targetRoute == null)
+            {
+                throw new InvalidOperationException(label + " 默认网关未切换到目标地址。");
             }
 
-            RunPowerShell(command);
+            // Only fail if another gateway has equal or higher priority (metric <= targetRoute.Metric).
+            // Low-priority RA routes (e.g. metric 4096) do not preempt our metric 0 target route.
+            List<string> unexpected = new List<string>();
+            foreach (RouteEntry route in routes)
+            {
+                if (route.Family == family && !AddressesEqual(route.NextHop, targetNorm) && route.Metric <= targetRoute.Metric)
+                {
+                    unexpected.Add(route.NextHop);
+                }
+            }
+            if (unexpected.Count > 0)
+            {
+                throw new InvalidOperationException(label + " 默认路由仍存在其他网关: " + string.Join(", ", unexpected.ToArray()));
+            }
+
+            if (!ContainsAddress(dns, targetNorm))
+            {
+                throw new InvalidOperationException("DNS 未包含目标 " + label + " 地址。");
+            }
         }
 
         private static bool HasDefaultRoute(int interfaceIndex, string destinationPrefix, string nextHop)
@@ -3007,32 +3202,41 @@ namespace YuanxinGateway
                 return false;
             }
 
-            string command = "$ErrorActionPreference='Stop';$idx=" + interfaceIndex + ";"
-                + "$prefix='" + EscapePowerShell(destinationPrefix) + "';"
-                + "$target='" + EscapePowerShell(nextHop) + "';"
-                + PowerShellNormalizeFunction()
-                + "$targetNorm=Normalize-Address $target;"
-                + "$route=Get-NetRoute -PolicyStore ActiveStore -ErrorAction Stop | Where-Object { $_.InterfaceIndex -eq $idx -and $_.DestinationPrefix -eq $prefix -and (Normalize-Address $_.NextHop) -eq $targetNorm } | Select-Object -First 1;"
-                + "if($route){Write-Output 'true'}else{Write-Output 'false'}";
-            return string.Equals(RunPowerShell(command).Trim(), "true", StringComparison.OrdinalIgnoreCase);
+            AddressFamily family = destinationPrefix == "::/0" ? AddressFamily.InterNetworkV6 : AddressFamily.InterNetwork;
+            string targetNorm = NormalizeAddressText(nextHop);
+            List<RouteEntry> routes = NativeNetwork.GetDefaultRoutes(interfaceIndex, family);
+            return routes.Exists(r => AddressesEqual(r.NextHop, targetNorm));
         }
 
         private static bool HasCompetingDefaultRoute(string targetGateway, WifiConfig current, string targetGatewayIpv6)
         {
             if (current == null || current.InterfaceIndex <= 0) return false;
-            string command = BuildRouteDriftCommand(current.InterfaceIndex, targetGateway, targetGatewayIpv6);
-            return string.Equals(RunPowerShell(command).Trim(), "true", StringComparison.OrdinalIgnoreCase);
+            List<RouteEntry> routes = NativeNetwork.GetDefaultRoutes(current.InterfaceIndex);
+            return HasCompetingDefaultRoute(routes, targetGateway, targetGatewayIpv6);
         }
 
-        private static string BuildRouteDriftCommand(int interfaceIndex, string targetGateway, string targetGatewayIpv6)
+        internal static bool HasCompetingDefaultRoute(List<RouteEntry> routes, string targetGateway, string targetGatewayIpv6)
         {
-            return RouteGuardSetup(interfaceIndex, targetGateway, targetGatewayIpv6)
-                + "$active=@(Get-NetRoute -PolicyStore ActiveStore -ErrorAction Stop | Where-Object { $_.InterfaceIndex -eq $idx });"
-                + "$persistent=@(Get-NetRoute -PolicyStore PersistentStore -ErrorAction Stop | Where-Object { $_.InterfaceIndex -eq $idx });"
-                + "$drift=$false;foreach($family in $families){$prefix=$family.Prefix;$targetNorm=Normalize-Address $family.Target;"
-                + "if(-not ($active | Where-Object { $_.DestinationPrefix -eq $prefix -and (Normalize-Address $_.NextHop) -eq $targetNorm })){$drift=$true};"
-                + "if(@($active+$persistent | Where-Object { $_.DestinationPrefix -eq $prefix -and ((Normalize-Address $_.NextHop) -ne $targetNorm -or $_.RouteMetric -ne 0) }).Count -gt 0){$drift=$true};}"
-                + "if($drift){Write-Output 'true'}else{Write-Output 'false'}";
+            if (IsFamilyDrifted(routes, AddressFamily.InterNetwork, targetGateway)) return true;
+            if (!string.IsNullOrEmpty(targetGatewayIpv6) && IsFamilyDrifted(routes, AddressFamily.InterNetworkV6, targetGatewayIpv6)) return true;
+            return false;
+        }
+
+        private static bool IsFamilyDrifted(List<RouteEntry> routes, AddressFamily family, string target)
+        {
+            string targetNorm = NormalizeAddressText(target);
+            RouteEntry targetRoute = routes.Find(r => r.Family == family && AddressesEqual(r.NextHop, targetNorm));
+            if (targetRoute == null) return true;
+            if (targetRoute.Metric != 0) return true;
+
+            foreach (RouteEntry route in routes)
+            {
+                if (route.Family == family && !AddressesEqual(route.NextHop, targetNorm) && route.Metric <= targetRoute.Metric)
+                {
+                    return true;
+                }
+            }
+            return false;
         }
 
         public static bool CheckHealth(string targetGateway)
@@ -3119,13 +3323,6 @@ namespace YuanxinGateway
             return argument.Append('"').ToString();
         }
 
-        private static string RunPowerShell(string command)
-        {
-            command = "$ProgressPreference='SilentlyContinue';" + command;
-            string encoded = Convert.ToBase64String(Encoding.Unicode.GetBytes(command));
-            return RunCommand("powershell.exe", "-NoProfile -NonInteractive -ExecutionPolicy Bypass -EncodedCommand " + encoded, 20000);
-        }
-
         private static string RunCommand(string fileName, string arguments, int timeoutMilliseconds)
         {
             ProcessStartInfo psi = new ProcessStartInfo
@@ -3137,29 +3334,49 @@ namespace YuanxinGateway
                 RedirectStandardError = true,
                 CreateNoWindow = true
             };
-            using (CommandJob job = new CommandJob())
-            using (Process process = Process.Start(psi))
+            CommandJob job = null;
+            try
             {
-                job.Assign(process);
-                Task<string> outputTask = process.StandardOutput.ReadToEndAsync();
-                Task<string> errorTask = process.StandardError.ReadToEndAsync();
-                if (!process.WaitForExit(timeoutMilliseconds))
+                try { job = new CommandJob(); }
+                catch (Exception ex) { DiagnosticLog.Write("CommandJob unavailable, falling back: " + ex.Message); }
+
+                using (Process process = Process.Start(psi))
                 {
-                    StopProcessTree(process, job);
-                    throw new TimeoutException(fileName + " 执行超时，已停止命令；请检查网络状态。 ");
+                    if (job != null)
+                    {
+                        try { job.Assign(process); }
+                        catch (Exception ex)
+                        {
+                            DiagnosticLog.Write("CommandJob assign failed, continuing without job object: " + ex.Message);
+                            job.Dispose();
+                            job = null;
+                        }
+                    }
+
+                    Task<string> outputTask = process.StandardOutput.ReadToEndAsync();
+                    Task<string> errorTask = process.StandardError.ReadToEndAsync();
+                    if (!process.WaitForExit(timeoutMilliseconds))
+                    {
+                        StopProcessTree(process, job);
+                        throw new TimeoutException(fileName + " 执行超时，已停止命令；请检查网络状态。");
+                    }
+                    if (!Task.WaitAll(new Task[] { outputTask, errorTask }, 2000))
+                    {
+                        StopProcessTree(process, job);
+                        throw new TimeoutException(fileName + " 输出读取超时。");
+                    }
+                    string output = outputTask.Result;
+                    string error = errorTask.Result;
+                    if (process.ExitCode != 0)
+                    {
+                        throw new InvalidOperationException(CleanCommandError(error, output));
+                    }
+                    return output;
                 }
-                if (!Task.WaitAll(new Task[] { outputTask, errorTask }, 2000))
-                {
-                    StopProcessTree(process, job);
-                    throw new TimeoutException(fileName + " 输出读取超时。 ");
-                }
-                string output = outputTask.Result;
-                string error = errorTask.Result;
-                if (process.ExitCode != 0)
-                {
-                    throw new InvalidOperationException(CleanCommandError(error, output));
-                }
-                return output;
+            }
+            finally
+            {
+                if (job != null) job.Dispose();
             }
         }
 
@@ -3171,48 +3388,34 @@ namespace YuanxinGateway
                 return "命令执行失败。";
             }
 
-            int xmlStart = text.IndexOf("<Objs", StringComparison.Ordinal);
-            if (xmlStart >= 0)
-            {
-                try
-                {
-                    XmlDocument document = new XmlDocument { XmlResolver = null };
-                    document.LoadXml(text.Substring(xmlStart));
-                    XmlNodeList errors = document.SelectNodes("//*[local-name()='S' and @S='Error']");
-                    StringBuilder message = new StringBuilder();
-                    foreach (XmlNode node in errors) message.Append(node.InnerText);
-                    if (message.Length == 0) return "PowerShell 命令执行失败，未返回可读错误信息。";
-                    text = message.ToString();
-                }
-                catch (XmlException)
-                {
-                    return "PowerShell 命令执行失败，错误信息格式不完整。";
-                }
-            }
-
-            text = text.Replace("_x000D_", "\r").Replace("_x000A_", "\n").Trim();
+            text = text.Trim();
             return string.IsNullOrWhiteSpace(text) ? "命令执行失败。" : text;
         }
 
         private static void StopProcessTree(Process process, CommandJob job)
         {
-            job.Terminate();
+            if (job != null)
+            {
+                job.Terminate();
+            }
+            else
+            {
+                try { if (!process.HasExited) process.Kill(); } catch { }
+            }
             if (!process.WaitForExit(3000)) throw new TimeoutException("无法确认命令已停止，请勿继续切换网络。");
         }
 
-        private static string EscapePowerShell(string value)
+        [DataContract]
+        private sealed class SavedRouteRecord
         {
-            return value.Replace("'", "''");
-        }
-
-        private static string QuotePowerShellArray(List<string> values)
-        {
-            List<string> quoted = new List<string>();
-            foreach (string value in values)
-            {
-                quoted.Add("'" + EscapePowerShell(value) + "'");
-            }
-            return string.Join(",", quoted.ToArray());
+            [DataMember]
+            public string PolicyStore;
+            [DataMember]
+            public string DestinationPrefix;
+            [DataMember]
+            public string NextHop;
+            [DataMember]
+            public int RouteMetric;
         }
 
         private sealed class OriginalConfig

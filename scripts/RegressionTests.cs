@@ -26,25 +26,16 @@ namespace YuanxinGateway
                         await FailedRestoreCanBeRetried();
                         await FailedSnapshotCanBeRetried();
                         CommandErrorsAreReadable();
-                        RestoreScriptsRemoveBothStores(false);
-                        RestoreScriptsRemoveBothStores(true);
-                        RestoreDoesNotReintroduceTargetFromCleanBackup();
-                        RestorePreservesPersistentRouteStore();
-                        RestoreRebindsIpv6ScopeToCurrentInterface();
-                        RestoreDeletionFailureIsReported();
-                        RestoreDnsBeforeRouteFailure();
-                        DnsWriteUsesPipelineObject();
+                        NativeStructLayoutMatchesWindowsSdk();
+                        ParseSavedRoutesFiltersTargetAndHandlesSingleObject();
+                        MetricFilterIgnoresHighMetricRaRoutes();
+                        VerifyAppliedFamilyIgnoresHighMetricRaRoutes();
                         NormalizeBackupRemovesTargetDns();
                         RouteRepairWaitsForStability();
                         RouteRepairStopsSafely();
-                        UnsafeBackupIsRejected();
-                        RouteGuardHandlesDhcp();
-                        RouteGuardPreservesFallbackOnFailure();
                         DnsProbeValidatesResponses();
                         AutoStartArgumentsRoundTrip();
-                        RestoreAfterDisconnectDoesNotCopyOldRoutes();
                         BackupIdentityCannotFallBackToAnotherAdapter();
-                        Ipv4RestoreDoesNotAdoptNewIpv6Settings();
                         await DisconnectedNetworkRestoresSafely();
                         await UnknownNetworkDoesNotRestore();
                         await DriftIsRepairedWithoutEnable();
@@ -242,61 +233,73 @@ function Register-DnsClient {[CmdletBinding()]param()}
 
         private static void CommandErrorsAreReadable()
         {
-            string xml = "#< CLIXML\r\n<Objs xmlns=\"http://schemas.microsoft.com/powershell/2004/04\">"
-                + "<Obj S=\"progress\"><S>loading module</S></Obj>"
-                + "<S S=\"Error\">route &lt;test&gt; denied_x000D__x000A_</S>"
-                + "<S S=\"Error\">second line &amp; details</S></Objs>";
-            string error = (string)ManagerCall("CleanCommandError", xml, "");
-            Assert(error == "route <test> denied\r\nsecond line & details", "CLIXML errors were not decoded correctly.");
             Assert((string)ManagerCall("CleanCommandError", "plain <test> error", "") == "plain <test> error",
-                "Plain command errors were stripped as XML.");
-            Assert(!(ManagerCall("CleanCommandError", "#< CLIXML\n<Objs broken", "") as string).Contains("<Objs"),
-                "Malformed CLIXML was displayed raw.");
-            Console.WriteLine("PASS: CLIXML errors decoded, progress excluded, plain errors preserved");
+                "Plain command errors were not preserved.");
+            Assert((string)ManagerCall("CleanCommandError", "  ", "") == "命令执行失败。",
+                "Empty command error did not fall back to default message.");
+            Console.WriteLine("PASS: native command errors preserved");
         }
 
-        private static void RestoreScriptsRemoveBothStores(bool contaminated)
+        private static void NativeStructLayoutMatchesWindowsSdk()
         {
-            object original = Original(contaminated);
-            string restore = (string)ManagerCall("BuildRestoreCommand", original, 12, true);
-            string verify = (string)ManagerCall("BuildVerifyRoutesCommand", original, 12, true);
-            string assertions = @"
-if($script:mockRoutes | Where-Object {$_.InterfaceIndex -eq 12 -and (Normalize-Address $_.NextHop) -in @('192.168.3.187','fe80::187')}){throw 'target route restored from backup'}
-if(-not ($script:mockRoutes | Where-Object {$_.InterfaceIndex -eq 12 -and $_.NextHop -eq '192.168.3.1' -and $_.RouteMetric -eq 0})){throw ('original gateway or metric not restored: ' + ($script:mockRoutes | ConvertTo-Json -Compress))}
-if(-not ($script:mockRoutes | Where-Object {$_.InterfaceIndex -eq 12 -and (Normalize-Address $_.NextHop) -eq 'fe80::1' -and $_.RouteMetric -eq 16})){throw 'original IPv6 gateway not restored'}
-if(-not ($script:mockRoutes | Where-Object {$_.InterfaceIndex -eq 88})){throw 'unrelated interface changed'}
-if($script:deletes[0] -ne 'PersistentStore:192.168.3.187'){throw 'persistent route not removed first'}
-if(@($script:dnsCalls | Where-Object {$_ -like '*:dhcp'}).Count -ne 2){throw 'DHCP DNS not restored for both families'}
-";
-            ManagerCall("RunPowerShell", NetworkStubs + restore + assertions + verify);
-            Console.WriteLine("PASS: actual restore script, both stores/families, original metric, unrelated adapter; contaminated=" + contaminated);
+            int rowSize = System.Runtime.InteropServices.Marshal.SizeOf(typeof(NativeNetwork.MIB_IPFORWARD_ROW2));
+            int inetSize = System.Runtime.InteropServices.Marshal.SizeOf(typeof(NativeNetwork.SOCKADDR_INET));
+            Assert(inetSize == 28, "SOCKADDR_INET size mismatch: " + inetSize);
+            Assert(rowSize == 104, "MIB_IPFORWARD_ROW2 size mismatch: " + rowSize);
+            List<RouteEntry> live = NativeNetwork.GetDefaultRoutes(0);
+            Assert(live != null, "GetDefaultRoutes returned null.");
+            Console.WriteLine("PASS: native MIB_IPFORWARD_ROW2 layout (104 bytes) and live GetIpForwardTable2 query succeeded");
         }
 
-        private static void RestoreDeletionFailureIsReported()
+        private static void ParseSavedRoutesFiltersTargetAndHandlesSingleObject()
         {
-            string restore = (string)ManagerCall("BuildRestoreCommand", Original(false), 12, true);
+            object original = Original(true);
+            System.Collections.IList parsed = (System.Collections.IList)ManagerCall("ParseSavedRoutes", original);
+            Assert(parsed.Count == 2, "Contaminated target routes were not filtered: " + parsed.Count);
+
+            original.GetType().GetField("RoutesJson").SetValue(original,
+                "{\"PolicyStore\":\"ActiveStore\",\"DestinationPrefix\":\"0.0.0.0/0\",\"NextHop\":\"192.168.3.1\",\"RouteMetric\":0}");
+            System.Collections.IList single = (System.Collections.IList)ManagerCall("ParseSavedRoutes", original);
+            Assert(single.Count == 1, "Single-object RoutesJson from legacy PowerShell backup failed to parse.");
+            Console.WriteLine("PASS: ParseSavedRoutes filters target routes and handles legacy single-object JSON");
+        }
+
+        private static void MetricFilterIgnoresHighMetricRaRoutes()
+        {
+            List<RouteEntry> routes = new List<RouteEntry>
+            {
+                new RouteEntry { Family = System.Net.Sockets.AddressFamily.InterNetwork, DestinationPrefix = "0.0.0.0/0", NextHop = "192.168.30.153", Metric = 0 },
+                new RouteEntry { Family = System.Net.Sockets.AddressFamily.InterNetworkV6, DestinationPrefix = "::/0", NextHop = "fe80::20c:29ff:fe2b:cd7d", Metric = 0 },
+                new RouteEntry { Family = System.Net.Sockets.AddressFamily.InterNetworkV6, DestinationPrefix = "::/0", NextHop = "fe80::92f6:44ff:fe68:2290", Metric = 4096 }
+            };
+            Assert(!GatewayManager.HasCompetingDefaultRoute(routes, "192.168.30.153", "fe80::20c:29ff:fe2b:cd7d"),
+                "High-metric RA route (4096) was falsely treated as competing drift.");
+
+            routes.Add(new RouteEntry { Family = System.Net.Sockets.AddressFamily.InterNetwork, DestinationPrefix = "0.0.0.0/0", NextHop = "192.168.30.1", Metric = 0 });
+            Assert(GatewayManager.HasCompetingDefaultRoute(routes, "192.168.30.153", "fe80::20c:29ff:fe2b:cd7d"),
+                "Equal-metric (0) competing route was not detected.");
+            Console.WriteLine("PASS: metric-based drift filter ignores high-metric RA routes and catches metric 0 conflicts");
+        }
+
+        private static void VerifyAppliedFamilyIgnoresHighMetricRaRoutes()
+        {
+            List<RouteEntry> routes = new List<RouteEntry>
+            {
+                new RouteEntry { Family = System.Net.Sockets.AddressFamily.InterNetworkV6, DestinationPrefix = "::/0", NextHop = "fe80::20c:29ff:fe2b:cd7d", Metric = 0 },
+                new RouteEntry { Family = System.Net.Sockets.AddressFamily.InterNetworkV6, DestinationPrefix = "::/0", NextHop = "fe80::92f6:44ff:fe68:2290", Metric = 4096 }
+            };
+            List<string> dns = new List<string> { "fe80::20c:29ff:fe2b:cd7d" };
+            ManagerCall("VerifyAppliedFamily", routes, dns, "::/0", System.Net.Sockets.AddressFamily.InterNetworkV6, "fe80::20c:29ff:fe2b:cd7d", "IPv6");
+
+            routes.Add(new RouteEntry { Family = System.Net.Sockets.AddressFamily.InterNetworkV6, DestinationPrefix = "::/0", NextHop = "fe80::1", Metric = 0 });
+            bool rejected = false;
             try
             {
-                ManagerCall("RunPowerShell", NetworkStubs + "$script:denyDelete=$true;" + restore);
-                throw new Exception("Route deletion failure was swallowed.");
+                ManagerCall("VerifyAppliedFamily", routes, dns, "::/0", System.Net.Sockets.AddressFamily.InterNetworkV6, "fe80::20c:29ff:fe2b:cd7d", "IPv6");
             }
-            catch (InvalidOperationException ex)
-            {
-                Assert(ex.Message.Contains("test: route deletion denied") && !ex.Message.Contains("<Objs"),
-                    "Deletion failure was not readable: " + ex.Message);
-            }
-            Console.WriteLine("PASS: actual PowerShell deletion errors are not swallowed or shown as XML");
-        }
-
-        private static void RestoreDnsBeforeRouteFailure()
-        {
-            object original = Original(false);
-            string restore = (string)ManagerCall("BuildRestoreCommand", original, 12, true);
-            ManagerCall("RunPowerShell", NetworkStubs + "$script:denyDelete=$true;$failed=$false;try{" + restore
-                + "}catch{$failed=$true};"
-                + "if(-not $failed){throw 'route failure was not reported'};"
-                + "if(@($script:dnsCalls | Where-Object {$_ -like '*:dhcp'}).Count -ne 2){throw 'DNS was not restored before route failure'};");
-            Console.WriteLine("PASS: DNS restored even when route removal fails");
+            catch (InvalidOperationException) { rejected = true; }
+            Assert(rejected, "Equal-metric competing IPv6 route was not rejected by VerifyAppliedFamily.");
+            Console.WriteLine("PASS: VerifyAppliedFamily allows high-metric RA routes and rejects metric 0 conflicts");
         }
 
         private static void NormalizeBackupRemovesTargetDns()
@@ -313,19 +316,6 @@ if(@($script:dnsCalls | Where-Object {$_ -like '*:dhcp'}).Count -ne 2){throw 'DH
             Assert(!(bool)type.GetField("IsDnsDhcp").GetValue(original), "Original static IPv4 DNS was changed to DHCP.");
             Assert((bool)type.GetField("IsIpv6DnsDhcp").GetValue(original), "Empty IPv6 DNS was not reset to DHCP.");
             Console.WriteLine("PASS: backup normalization removes bypass DNS consistently across backup versions");
-        }
-
-        private static void DnsWriteUsesPipelineObject()
-        {
-            object original = Original(false);
-            string restore = (string)ManagerCall("BuildRestoreCommand", original, 12, true);
-            Assert(restore.Contains("Get-DnsClientServerAddress -InterfaceIndex $idx -AddressFamily 'IPv4' -ErrorAction Stop | Set-DnsClientServerAddress"),
-                "IPv4 DNS write did not target the IPv4 CIM object.");
-            Assert(!restore.Contains("Set-DnsClientServerAddress -InterfaceIndex $idx -AddressFamily"),
-                "DNS write used a nonexistent AddressFamily parameter.");
-            Assert(restore.Contains("-AddressFamily 'IPv6' -ErrorAction Stop | Set-DnsClientServerAddress"),
-                "IPv6 DNS write did not target the IPv6 CIM object.");
-            Console.WriteLine("PASS: DNS writes use supported pipeline objects and preserve address-family isolation");
         }
 
         private static void RouteRepairWaitsForStability()
@@ -397,62 +387,6 @@ if(@($script:dnsCalls | Where-Object {$_ -like '*:dhcp'}).Count -ne 2){throw 'DH
             Console.WriteLine("PASS: network changes, permissions and DNS errors abort route retries");
         }
 
-        private static void RestoreDoesNotReintroduceTargetFromCleanBackup()
-        {
-            object original = Original(false);
-            Type type = original.GetType();
-            type.GetField("RoutesJson").SetValue(original,
-                "[{\"PolicyStore\":\"ActiveStore\",\"DestinationPrefix\":\"0.0.0.0/0\",\"NextHop\":\"192.168.3.1\",\"RouteMetric\":0},"
-                + "{\"PolicyStore\":\"ActiveStore\",\"DestinationPrefix\":\"0.0.0.0/0\",\"NextHop\":\"192.168.3.187\",\"RouteMetric\":1}]");
-            string restore = (string)ManagerCall("BuildRestoreCommand", original, 12, true);
-            ManagerCall("RunPowerShell", NetworkStubs + restore
-                + "if($script:mockRoutes | Where-Object {$_.InterfaceIndex -eq 12 -and (Normalize-Address $_.NextHop) -eq '192.168.3.187'}){throw 'target route was restored from a clean backup'};");
-            Console.WriteLine("PASS: restore filters target routes even when backup gateway is different");
-        }
-
-        private static void RestorePreservesPersistentRouteStore()
-        {
-            object original = Original(false);
-            Type type = original.GetType();
-            type.GetField("RoutesJson").SetValue(original,
-                "[{\"PolicyStore\":\"PersistentStore\",\"DestinationPrefix\":\"0.0.0.0/0\",\"NextHop\":\"192.168.3.1\",\"RouteMetric\":7}]");
-            string restore = (string)ManagerCall("BuildRestoreCommand", original, 12, true);
-            ManagerCall("RunPowerShell", NetworkStubs + restore
-                + "$persistent=$script:mockRoutes | Where-Object {$_.InterfaceIndex -eq 12 -and $_.PolicyStore -eq 'PersistentStore' -and $_.NextHop -eq '192.168.3.1'};"
-                + "if(-not $persistent -or $persistent.RouteMetric -ne 7){throw 'persistent original route was not restored to PersistentStore'};");
-            Console.WriteLine("PASS: restore preserves PersistentStore routes and metrics");
-        }
-
-        private static void RestoreRebindsIpv6ScopeToCurrentInterface()
-        {
-            object original = Original(false);
-            original.GetType().GetField("RoutesJson").SetValue(original,
-                "[{\"PolicyStore\":\"ActiveStore\",\"DestinationPrefix\":\"::/0\",\"NextHop\":\"fe80::1%10\",\"RouteMetric\":16}]");
-            string restore = (string)ManagerCall("BuildRestoreCommand", original, 12, true);
-            string script = NetworkStubs
-                + "function New-NetRoute { [CmdletBinding()]param($PolicyStore='ActiveStore',$InterfaceIndex,$DestinationPrefix,$NextHop,$RouteMetric);"
-                + "if($NextHop -like 'fe80:*%*'){throw 'scoped link-local next hop rejected'};"
-                + "$script:mockRoutes += [pscustomobject]@{PolicyStore=$PolicyStore;InterfaceIndex=$InterfaceIndex;DestinationPrefix=$DestinationPrefix;NextHop=$NextHop;RouteMetric=$RouteMetric} }"
-                + restore
-                + "if(-not ($script:mockRoutes | Where-Object {$_.InterfaceIndex -eq 12 -and $_.DestinationPrefix -eq '::/0' -and $_.NextHop -eq 'fe80::1' -and $_.RouteMetric -eq 16})){throw 'IPv6 route did not restore with unscoped next hop'};";
-            ManagerCall("RunPowerShell", script);
-            Console.WriteLine("PASS: IPv6 link-local restore discards stale scope and uses current interface");
-        }
-
-        private static void UnsafeBackupIsRejected()
-        {
-            object original = Original(true);
-            original.GetType().GetField("RoutesJson").SetValue(original,
-                "[{\"PolicyStore\":\"ActiveStore\",\"DestinationPrefix\":\"0.0.0.0/0\",\"NextHop\":\"192.168.3.187\",\"RouteMetric\":1}]");
-            string restore = (string)ManagerCall("BuildRestoreCommand", original, 12, true);
-            string script = NetworkStubs + "$rejected=$false;try{" + restore + "}catch{"
-                + "if($_.Exception.Message -notlike '*无法确定原网关*'){throw};$rejected=$true};"
-                + "if(-not $rejected -or $script:deletes.Count -ne 0){throw 'unsafe backup changed live routes'};";
-            ManagerCall("RunPowerShell", script);
-            Console.WriteLine("PASS: backup without a non-target gateway rejected before network changes");
-        }
-
-
         private static async Task RefreshAndWait(MainForm form)
         {
             Refresh(form);
@@ -460,18 +394,6 @@ if(@($script:dnsCalls | Where-Object {$_ -like '*:dhcp'}).Count -ne 2){throw 'DH
             {
                 while (Get<bool>(form, "isRefreshing")) await Task.Delay(10);
             }));
-        }
-
-        private static void RestoreAfterDisconnectDoesNotCopyOldRoutes()
-        {
-            object original = Original(false);
-            string restore = (string)ManagerCall("BuildRestoreCommand", original, 12, false);
-            string verify = (string)ManagerCall("BuildVerifyRoutesCommand", original, 12, false);
-            ManagerCall("RunPowerShell", NetworkStubs + restore + verify
-                + "if($script:mockRoutes | Where-Object {$_.InterfaceIndex -eq 12}){throw 'old routes copied to disconnected/new network'};"
-                + "if(-not ($script:mockRoutes | Where-Object {$_.InterfaceIndex -eq 88})){throw 'wired adapter changed'};"
-                + "if(@($script:dnsCalls | Where-Object {$_ -like '*:dhcp'}).Count -ne 2){throw 'DNS not reset'};");
-            Console.WriteLine("PASS: disconnected/changed network cleanup only removes owned routes on saved interface");
         }
 
         private static void BackupIdentityCannotFallBackToAnotherAdapter()
@@ -494,17 +416,6 @@ if(@($script:dnsCalls | Where-Object {$_ -like '*:dhcp'}).Count -ne 2){throw 'DH
             current.IsConnected = false;
             Assert(!(bool)ManagerCall("IsSameNetwork", original, current), "Disconnected adapter considered original connected network.");
             Console.WriteLine("PASS: saved GUID is authoritative, no fallback to another adapter, disconnected identity rejected");
-        }
-
-        private static void Ipv4RestoreDoesNotAdoptNewIpv6Settings()
-        {
-            object original = Original(false);
-            original.GetType().GetField("TargetGatewayIpv6").SetValue(original, "");
-            string restore = (string)ManagerCall("BuildRestoreCommand", original, 12, false);
-            ManagerCall("RunPowerShell", NetworkStubs + restore
-                + "if(-not ($script:mockRoutes | Where-Object {$_.InterfaceIndex -eq 12 -and $_.DestinationPrefix -eq '::/0'})){throw 'IPv4 restore removed unrelated IPv6 route'};"
-                + "if($script:dnsCalls | Where-Object {$_ -like '*IPv6*'}){throw 'IPv4 restore changed IPv6 DNS'};");
-            Console.WriteLine("PASS: restoring IPv4 backup does not adopt later IPv6 settings");
         }
 
         private static void PrimeNetwork(MainForm form, FakeOperations operations)
@@ -616,49 +527,6 @@ if(@($script:dnsCalls | Where-Object {$_ -like '*:dhcp'}).Count -ne 2){throw 'DH
                     "Automatic enable undid the health fallback.");
             }
             Console.WriteLine("PASS: three failed health rounds restore once and inhibit automatic re-enable");
-        }
-
-        private static void RouteGuardHandlesDhcp()
-        {
-            string repair = (string)ManagerCall("BuildRepairTargetCommand", 12, "192.168.3.187", "fe80::187");
-            string detect = (string)ManagerCall("BuildRouteDriftCommand", 12, "192.168.3.187", "fe80::187");
-            string injection = @"
-$script:mockRoutes += @(
-[pscustomobject]@{PolicyStore='ActiveStore';InterfaceIndex=12;DestinationPrefix='0.0.0.0/0';NextHop='192.168.3.1';RouteMetric=0},
-[pscustomobject]@{PolicyStore='ActiveStore';InterfaceIndex=12;DestinationPrefix='::/0';NextHop='fe80::1';RouteMetric=0},
-[pscustomobject]@{PolicyStore='ActiveStore';InterfaceIndex=12;DestinationPrefix='10.0.0.0/8';NextHop='192.168.3.1';RouteMetric=0}
-);";
-            string checks = @"
-if($script:deletes | Where-Object {$_ -like '*192.168.3.187' -or $_ -like '*fe80::187'}){throw 'guard deleted working target route'}
-if(-not ($script:mockRoutes | Where-Object {$_.InterfaceIndex -eq 88})){throw 'guard changed another adapter'}
-if(-not ($script:mockRoutes | Where-Object {$_.DestinationPrefix -eq '10.0.0.0/8'})){throw 'guard changed non-default route'}
-if($script:dnsCalls.Count -ne 0){throw 'guard rewrote DNS unnecessarily'}
-";
-            ManagerCall("RunPowerShell", NetworkStubs + injection
-                + "if((& {" + detect + "}) -ne 'true'){throw 'DHCP metric zero not detected'};"
-                + repair + checks
-                + "if((& {" + detect + "}) -ne 'false'){throw 'route drift still present'};"
-                + injection + repair + checks);
-            string ipv4Only = (string)ManagerCall("BuildRepairTargetCommand", 12, "192.168.3.187", "");
-            ManagerCall("RunPowerShell", NetworkStubs + ipv4Only
-                + "if(-not ($script:mockRoutes | Where-Object {$_.DestinationPrefix -eq '::/0' -and $_.RouteMetric -eq 1})){throw 'IPv4-only guard changed IPv6'};");
-            Console.WriteLine("PASS: real guard script repairs DHCP metric 0 repeatedly, preserves target/other adapters/non-default/IPv6-only routes");
-        }
-
-        private static void RouteGuardPreservesFallbackOnFailure()
-        {
-            string repair = (string)ManagerCall("BuildRepairTargetCommand", 12, "192.168.3.187", "");
-            string script = NetworkStubs + @"
-$script:mockRoutes=@([pscustomobject]@{PolicyStore='ActiveStore';InterfaceIndex=12;DestinationPrefix='0.0.0.0/0';NextHop='192.168.3.1';RouteMetric=0});
-function New-NetRoute {[CmdletBinding()]param($PolicyStore,$InterfaceIndex,$DestinationPrefix,$NextHop,$RouteMetric);throw 'cannot add target'}
-$failed=$false;try{" + repair + @"}catch{$failed=$true}
-if(-not $failed -or $script:deletes.Count -ne 0){throw 'fallback removed before target established'}
-";
-            ManagerCall("RunPowerShell", script);
-            ManagerCall("RunPowerShell", NetworkStubs
-                + "$script:denyDelete=$true;$script:mockRoutes += [pscustomobject]@{PolicyStore='ActiveStore';InterfaceIndex=12;DestinationPrefix='0.0.0.0/0';NextHop='192.168.3.1';RouteMetric=0};"
-                + "$failed=$false;try{" + repair + "}catch{$failed=$true};if(-not $failed){throw 'guard deletion error swallowed'};");
-            Console.WriteLine("PASS: guard keeps fallback if target creation fails and reports deletion failure");
         }
 
         private static void DnsProbeValidatesResponses()
